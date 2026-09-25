@@ -280,6 +280,7 @@ function lifecycleItem(item: ApprovedRow, views: Map<string, LifecycleView>) {
     idempotency_key: item.metadata.idempotency_key,
     stored_at: item.metadata.stored_at,
     record_version: item.row.version,
+    readback_status: "verified" as const,
     ...views.get(item.record.memory_id)!,
   };
 }

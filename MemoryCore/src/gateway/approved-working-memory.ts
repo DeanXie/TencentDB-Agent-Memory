@@ -30,11 +30,14 @@ const approvedPayloadSchema = z.object({
   status: z.literal("current"),
   candidate_digest: sha,
   candidate_version: z.literal(1),
-  expected_version: z.null(),
+  expected_version: z.number().int().min(1).nullable(),
   supersedes: z.array(safeId).max(8).refine((value) => new Set(value).size === value.length),
 }).strict().superRefine((value, ctx) => {
   if ((value.scope === "cross_project") !== (value.allowed_project_ids.length > 0)) {
     ctx.addIssue({ code: "custom", message: "scope/allowed_project_ids mismatch" });
+  }
+  if ((value.supersedes.length === 0) !== (value.expected_version === null) || value.supersedes.length > 1) {
+    ctx.addIssue({ code: "custom", message: "supersedes/expected_version mismatch" });
   }
 });
 
@@ -93,6 +96,7 @@ const approvedStoredMetadataSchema = z.object({
 
 type ApprovedPayload = z.infer<typeof approvedPayloadSchema>;
 type Admission = z.infer<typeof admissionSchema>;
+type ApprovedRow = NonNullable<ReturnType<typeof parseApprovedRow>>;
 type Isolation = { teamId?: string; userId: string; agentId: string; sessionId: string; taskId?: string };
 export interface ApprovedWorkingMemoryDeps {
   getStore: () => IMemoryStore | undefined;
@@ -160,6 +164,9 @@ function parseApprovedRow(row: L1RecordRow, isolation?: Isolation) {
     const parsed = approvedStoredMetadataSchema.safeParse(JSON.parse(row.metadata_json));
     if (!parsed.success || parsed.data.approved_payload.memory_id !== row.record_id ||
         parsed.data.approved_payload.content !== row.content) return null;
+    const expectedMemoryId = `wm_sha256_${digest("cmg/working-memory-write-payload/v1/identity",
+      omit(parsed.data.approved_payload, "memory_id")).slice(7)}`;
+    if (parsed.data.approved_payload.memory_id !== expectedMemoryId) return null;
     const expectedDigest = digest("cmg/working-memory-write-payload/v1/snapshot", parsed.data.approved_payload);
     if (parsed.data.write_payload_digest !== expectedDigest) return null;
     return { row, metadata: parsed.data, record: parsed.data.approved_payload, payload_digest: expectedDigest };
@@ -171,6 +178,110 @@ async function approvedRows(store: IMemoryStore, isolation?: Isolation) {
     teamId: isolation?.teamId, userId: isolation?.userId, agentId: isolation?.agentId,
   });
   return rows.map((row) => parseApprovedRow(row, isolation)).filter((value) => value !== null);
+}
+
+const writeLocks = new WeakMap<object, Promise<void>>();
+
+async function withStoreWriteLock<T>(store: IMemoryStore, operation: () => Promise<T>): Promise<T> {
+  const previous = writeLocks.get(store as object) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.then(() => gate);
+  writeLocks.set(store as object, tail);
+  await previous;
+  try { return await operation(); }
+  finally {
+    release();
+    if (writeLocks.get(store as object) === tail) writeLocks.delete(store as object);
+  }
+}
+
+function sameScope(left: ApprovedPayload, right: ApprovedPayload): boolean {
+  return left.scope === right.scope && left.scope_id === right.scope_id &&
+    stable(left.allowed_project_ids) === stable(right.allowed_project_ids);
+}
+
+type LifecycleView = {
+  currentness: "current" | "superseded" | "conflicted" | "invalid";
+  lineage_status: "valid" | "conflict" | "invalid";
+  predecessor_ids: string[];
+  successor_ids: string[];
+  relation_digest: string | null;
+};
+
+function lifecycleViews(items: ApprovedRow[]): Map<string, LifecycleView> {
+  const byId = new Map(items.map((item) => [item.record.memory_id, item]));
+  const successors = new Map<string, string[]>();
+  const invalid = new Set<string>();
+  const relations = new Map<string, string>();
+  for (const item of items) {
+    const { record } = item;
+    if (record.supersedes.length === 0) continue;
+    const predecessorId = record.supersedes[0];
+    const predecessor = byId.get(predecessorId);
+    if (predecessorId === record.memory_id || !predecessor || !sameScope(record, predecessor.record) ||
+        record.expected_version !== predecessor.row.version) {
+      invalid.add(record.memory_id);
+      continue;
+    }
+    successors.set(predecessorId, [...(successors.get(predecessorId) ?? []), record.memory_id]);
+    relations.set(record.memory_id, digest(`${APPROVED_WORKING_MEMORY_RECORD_CONTRACT}/supersession-relation`, {
+      predecessor_id: predecessorId,
+      predecessor_digest: predecessor.payload_digest,
+      successor_id: record.memory_id,
+      successor_digest: item.payload_digest,
+      scope: record.scope,
+      scope_id: record.scope_id,
+      allowed_project_ids: record.allowed_project_ids,
+    }));
+  }
+  for (const item of items) {
+    const origin = item.record.memory_id;
+    const seen = new Set<string>();
+    let cursor: string | undefined = origin;
+    while (cursor) {
+      if (seen.has(cursor)) {
+        for (const id of seen) invalid.add(id);
+        break;
+      }
+      seen.add(cursor);
+      const current = byId.get(cursor);
+      cursor = current?.record.supersedes[0];
+    }
+  }
+  const branched = new Set<string>();
+  for (const [predecessorId, ids] of successors) {
+    if (ids.length > 1) {
+      branched.add(predecessorId);
+      ids.forEach((id) => branched.add(id));
+    }
+  }
+  return new Map(items.map((item) => {
+    const id = item.record.memory_id;
+    const successorIds = [...(successors.get(id) ?? [])].sort();
+    const predecessorIds = [...item.record.supersedes];
+    const currentness = invalid.has(id) ? "invalid" : branched.has(id) ? "conflicted" :
+      successorIds.length === 1 ? "superseded" : "current";
+    return [id, {
+      currentness,
+      lineage_status: invalid.has(id) ? "invalid" : branched.has(id) ? "conflict" : "valid",
+      predecessor_ids: predecessorIds,
+      successor_ids: successorIds,
+      relation_digest: relations.get(id) ?? null,
+    }];
+  }));
+}
+
+function lifecycleItem(item: ApprovedRow, views: Map<string, LifecycleView>) {
+  return {
+    record: item.record,
+    write_payload_digest: item.payload_digest,
+    admission_digest: item.metadata.admission_digest,
+    idempotency_key: item.metadata.idempotency_key,
+    stored_at: item.metadata.stored_at,
+    record_version: item.row.version,
+    ...views.get(item.record.memory_id)!,
+  };
 }
 
 function persistenceResult(status: string, admission: Admission, record: ApprovedPayload, storedAt: string,
@@ -203,6 +314,7 @@ export async function handleApprovedMemoryWrite(body: unknown, _auth: V2AuthCont
   if (!store || !isolation?.teamId || !isolation.userId || !isolation.agentId || !isolation.sessionId) {
     return errorEnvelope(503, "approved memory store or isolation unavailable", requestId);
   }
+  return withStoreWriteLock(store, async () => {
   const now = deps.now?.() ?? new Date().toISOString();
   const rawRows = await store.queryL1Records({
     teamId: isolation.teamId, userId: isolation.userId, agentId: isolation.agentId,
@@ -221,6 +333,19 @@ export async function handleApprovedMemoryWrite(body: unknown, _auth: V2AuthCont
     return exact
       ? successEnvelope(persistenceResult("exact_replay", admission, record, String(existing.metadata.stored_at), "verified"), requestId)
       : errorWithData(409, "approved memory conflict", requestId, persistenceResult("conflict", admission, record, now, "not_verified"));
+  }
+  const existingApproved = rawRows.map((row) => parseApprovedRow(row, isolation)).filter((item) => item !== null);
+  let writeStatus = "created";
+  if (record.supersedes.length === 1) {
+    const predecessorId = record.supersedes[0];
+    const predecessor = existingApproved.find((item) => item.record.memory_id === predecessorId);
+    const views = lifecycleViews(existingApproved);
+    if (!predecessor || predecessorId === record.memory_id || !sameScope(record, predecessor.record) ||
+        record.expected_version !== predecessor.row.version || views.get(predecessorId)?.currentness !== "current") {
+      return errorWithData(409, "approved memory supersession conflict", requestId,
+        persistenceResult("conflict", admission, record, now, "not_verified"));
+    }
+    writeStatus = "updated";
   }
   const metadata = {
     contract: APPROVED_WORKING_MEMORY_RECORD_CONTRACT,
@@ -263,7 +388,8 @@ export async function handleApprovedMemoryWrite(body: unknown, _auth: V2AuthCont
   if (!exact) {
     return errorWithData(409, "approved memory readback mismatch", requestId, persistenceResult("conflict", admission, record, now, "mismatch"));
   }
-  return successEnvelope(persistenceResult("created", admission, record, now, "verified"), requestId);
+  return successEnvelope(persistenceResult(writeStatus, admission, record, now, "verified"), requestId);
+  });
 }
 
 export async function handleApprovedMemoryGet(body: unknown, _auth: V2AuthContext, requestId: string,
@@ -272,12 +398,11 @@ export async function handleApprovedMemoryGet(body: unknown, _auth: V2AuthContex
   const store = deps.getStore();
   if (!parsed.success) return errorEnvelope(400, "approved memory get invalid", requestId);
   if (!store) return errorEnvelope(503, "approved memory store unavailable", requestId);
-  const match = (await approvedRows(store, deps.requestIsolation)).find((item) => item.record.memory_id === parsed.data.memory_id &&
+  const items = await approvedRows(store, deps.requestIsolation);
+  const match = items.find((item) => item.record.memory_id === parsed.data.memory_id &&
     item.metadata.idempotency_key === parsed.data.idempotency_key && item.record.scope === parsed.data.scope &&
     item.record.scope_id === parsed.data.scope_id);
-  return match ? successEnvelope({ record: match.record, write_payload_digest: match.payload_digest,
-    admission_digest: match.metadata.admission_digest, idempotency_key: match.metadata.idempotency_key,
-    stored_at: match.metadata.stored_at, readback_status: "verified" }, requestId)
+  return match ? successEnvelope({ ...lifecycleItem(match, lifecycleViews(items)), readback_status: "verified" }, requestId)
     : errorEnvelope(404, "approved memory not found", requestId);
 }
 
@@ -287,11 +412,11 @@ export async function handleApprovedMemorySearch(body: unknown, _auth: V2AuthCon
   const store = deps.getStore();
   if (!parsed.success) return errorEnvelope(400, "approved memory search invalid", requestId);
   if (!store) return errorEnvelope(503, "approved memory store unavailable", requestId);
-  const items = (await approvedRows(store, deps.requestIsolation)).filter((item) => item.record.scope === parsed.data.scope &&
+  const approved = await approvedRows(store, deps.requestIsolation);
+  const views = lifecycleViews(approved);
+  const items = approved.filter((item) => item.record.scope === parsed.data.scope &&
     item.record.scope_id === parsed.data.scope_id && (parsed.data.allowed_project_ids === undefined ||
-      stable(item.record.allowed_project_ids) === stable(parsed.data.allowed_project_ids))).map((item) => ({
-        record: item.record, write_payload_digest: item.payload_digest, admission_digest: item.metadata.admission_digest,
-        idempotency_key: item.metadata.idempotency_key, stored_at: item.metadata.stored_at,
-      }));
+      stable(item.record.allowed_project_ids) === stable(parsed.data.allowed_project_ids)))
+    .map((item) => lifecycleItem(item, views));
   return successEnvelope({ items, total: items.length }, requestId);
 }

@@ -28,6 +28,11 @@ import { executeMemorySearch } from "../core/tools/memory-search.js";
 import { executeConversationSearch } from "../core/tools/conversation-search.js";
 import type { MemoryRecord } from "../core/record/l1-writer.js";
 import { reportRecallMetrics } from "../core/report/metric-tracking-recall.js";
+import {
+  handleApprovedMemoryGet,
+  handleApprovedMemorySearch,
+  handleApprovedMemoryWrite,
+} from "./approved-working-memory.js";
 
 // ── Zod schemas (validated types + defaults) ──
 import {
@@ -169,6 +174,9 @@ const V3_ALLOWED_SUBPATHS = new Set<string>([
   "/core/read",
   "/core/write",
   "/core/count",
+  "/approved-memory/write",
+  "/approved-memory/get",
+  "/approved-memory/search",
 ]);
 
 /**
@@ -429,6 +437,9 @@ const DATAPLANE_HANDLERS: Record<string, RouteHandler> = {
   "/core/read": handleCoreRead,
   "/core/write": handleCoreWrite,
   "/core/count": handleCoreCount,
+  "/approved-memory/write": handleApprovedMemoryWrite,
+  "/approved-memory/get": handleApprovedMemoryGet,
+  "/approved-memory/search": handleApprovedMemorySearch,
 };
 
 const routeTable: Record<string, RouteHandler> = {

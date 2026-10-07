@@ -133,6 +133,12 @@ export interface L1RecordRow {
   metadata_json: string;
 }
 
+/** Authoritative exact-primary-key read used by create-if-absent writers. */
+export type L1ExactReadResult =
+  | { status: "found"; row: L1RecordRow }
+  | { status: "not_found" }
+  | { status: "read_failed" };
+
 // ============================
 // L0 Types (Raw Conversations)
 // ============================
@@ -577,6 +583,8 @@ export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStor
   // ── L1 Read ──────────────────────────────────────────────
 
   countL1(filter?: L1CountFilter): MaybePromise<number>;
+  /** Optional fail-closed capability. Callers must not infer absence when it is missing. */
+  readL1RecordExact?(recordId: string): MaybePromise<L1ExactReadResult>;
   queryL1Records(filter?: L1QueryFilter): MaybePromise<L1RecordRow[]>;
   getAllL1Texts(): MaybePromise<Array<{ record_id: string; content: string; updated_time: string }>>;
 

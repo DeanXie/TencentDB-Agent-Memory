@@ -20,6 +20,7 @@ import type {
   L1SearchResult,
   L1FtsResult,
   L1RecordRow,
+  L1ExactReadResult,
   L1QueryFilter,
   L0SearchResult,
   L0FtsResult,
@@ -930,6 +931,58 @@ export class TcvdbMemoryStore implements IMemoryStore {
     } catch (err) {
       this.logger?.warn(`${TAG} [L1-query] FAILED: ${err instanceof Error ? err.message : String(err)}`);
       return [];
+    }
+  }
+
+  async readL1RecordExact(recordId: string): Promise<L1ExactReadResult> {
+    try {
+      await this._ensureInit();
+      if (this.degraded) return { status: "read_failed" };
+      const response = await this.client.query(this.l1Collection, {
+        retrieveVector: false,
+        documentIds: [recordId],
+        outputFields: L1_OUTPUT_FIELDS,
+      });
+      if (!response || !Array.isArray(response.documents)) return { status: "read_failed" };
+      if (response.documents.length === 0) return { status: "not_found" };
+      if (response.documents.length !== 1) return { status: "read_failed" };
+      const doc = response.documents[0];
+      if (!doc || typeof doc !== "object" || Array.isArray(doc) || doc.id !== recordId ||
+          typeof doc.text !== "string" || typeof doc.type !== "string" ||
+          typeof doc.priority !== "number" || !Number.isFinite(doc.priority) ||
+          typeof doc.scene_name !== "string" || typeof doc.session_key !== "string" ||
+          typeof doc.session_id !== "string" || typeof doc.task_id !== "string" ||
+          typeof doc.team_id !== "string" || typeof doc.user_id !== "string" ||
+          typeof doc.agent_id !== "string" || typeof doc.version !== "number" || !Number.isFinite(doc.version) ||
+          typeof doc.timestamp_str !== "string" || typeof doc.timestamp_start !== "string" ||
+          typeof doc.timestamp_end !== "string" || typeof doc.metadata_json !== "string" ||
+          typeof doc.created_time_ms !== "number" || !Number.isFinite(doc.created_time_ms) ||
+          typeof doc.updated_time_ms !== "number" || !Number.isFinite(doc.updated_time_ms)) {
+        return { status: "read_failed" };
+      }
+      return { status: "found", row: {
+        record_id: doc.id,
+        content: doc.text,
+        type: doc.type,
+        priority: doc.priority,
+        scene_name: doc.scene_name,
+        session_key: doc.session_key,
+        session_id: doc.session_id,
+        task_id: doc.task_id,
+        team_id: doc.team_id,
+        user_id: doc.user_id,
+        agent_id: doc.agent_id,
+        version: doc.version,
+        timestamp_str: doc.timestamp_str,
+        timestamp_start: doc.timestamp_start,
+        timestamp_end: doc.timestamp_end,
+        created_time: epochMsToIso(doc.created_time_ms),
+        updated_time: epochMsToIso(doc.updated_time_ms),
+        metadata_json: doc.metadata_json,
+      } };
+    } catch (err) {
+      this.logger?.warn(`${TAG} [L1-exact-read] FAILED: ${err instanceof Error ? err.message : String(err)}`);
+      return { status: "read_failed" };
     }
   }
 

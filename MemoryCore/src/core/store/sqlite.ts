@@ -37,6 +37,7 @@ import type {
   L0FtsResult,
   L0QueryRow,
   L1RecordRow,
+  L1ExactReadResult,
   L1QueryFilter,
   L0CountFilter,
   L0PaginatedFilter,
@@ -395,6 +396,7 @@ export class VectorStore implements IMemoryStore {
   private stmtInsertVec?: StatementSync;   // optional — only set when vecTablesReady
   private stmtDeleteMeta!: StatementSync;
   private stmtGetMeta!: StatementSync;
+  private stmtGetL1Exact!: StatementSync;
   private stmtSearchVec?: StatementSync;   // optional — only set when vecTablesReady
   private stmtQueryBySessionId!: StatementSync;
   private stmtQueryBySessionIdSince!: StatementSync;
@@ -726,6 +728,12 @@ export class VectorStore implements IMemoryStore {
     this.stmtGetMeta = this.db.prepare(`
       SELECT content, type, priority, scene_name, session_key, session_id, team_id, task_id, user_id, agent_id,
              version, timestamp_str, timestamp_start, timestamp_end, metadata_json
+      FROM l1_records WHERE record_id = ?
+    `);
+    this.stmtGetL1Exact = this.db.prepare(`
+      SELECT record_id, content, type, priority, scene_name, session_key, session_id, team_id, task_id,
+             user_id, agent_id, version, timestamp_str, timestamp_start, timestamp_end,
+             created_time, updated_time, metadata_json
       FROM l1_records WHERE record_id = ?
     `);
 
@@ -1838,6 +1846,21 @@ export class VectorStore implements IMemoryStore {
         `${TAG} [L1-query] FAILED (non-fatal, returning empty): ${err instanceof Error ? err.message : String(err)}`
       );
       return [];
+    }
+  }
+
+  readL1RecordExact(recordId: string): L1ExactReadResult {
+    if (this.degraded || this.closed) return { status: "read_failed" };
+    try {
+      const row = this.stmtGetL1Exact.get(recordId) as L1RecordRow | undefined;
+      if (!row) return { status: "not_found" };
+      if (row.record_id !== recordId) return { status: "read_failed" };
+      return { status: "found", row };
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} [L1-exact-read] FAILED: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return { status: "read_failed" };
     }
   }
 

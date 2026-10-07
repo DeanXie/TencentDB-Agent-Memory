@@ -670,12 +670,41 @@ export async function handleApprovedMemoryGet(body: unknown, _auth: V2AuthContex
   const store = deps.getStore();
   if (!parsed.success) return errorEnvelope(400, "approved memory get invalid", requestId);
   if (!store) return errorEnvelope(503, "approved memory store unavailable", requestId);
-  const items = await approvedRows(store, deps.requestIsolation);
-  const match = items.find((item) => item.record.memory_id === parsed.data.memory_id &&
-    item.metadata.idempotency_key === parsed.data.idempotency_key && item.record.scope === parsed.data.scope &&
-    item.record.scope_id === parsed.data.scope_id);
-  return match ? successEnvelope({ ...lifecycleItem(match, lifecycleViews(items)), readback_status: "verified" }, requestId)
-    : errorEnvelope(404, "approved memory not found", requestId);
+  try {
+    if (typeof store.isDegraded === "function" && store.isDegraded()) {
+      return errorEnvelope(503, "approved memory exact read unavailable", requestId);
+    }
+  } catch {
+    return errorEnvelope(503, "approved memory exact read unavailable", requestId);
+  }
+  if (typeof store.readL1RecordExact !== "function") {
+    return errorEnvelope(503, "approved memory exact read unavailable", requestId);
+  }
+  let exactRead;
+  try {
+    exactRead = await store.readL1RecordExact(parsed.data.memory_id);
+  } catch {
+    exactRead = { status: "read_failed" as const };
+  }
+  if (!exactRead || exactRead.status === "read_failed" ||
+      (exactRead.status !== "found" && exactRead.status !== "not_found")) {
+    return errorEnvelope(503, "approved memory exact read unavailable", requestId);
+  }
+  if (exactRead.status === "not_found") {
+    return errorEnvelope(404, "approved memory not found", requestId);
+  }
+  const row = exactRead.row;
+  if (!row || typeof row !== "object" || row.record_id !== parsed.data.memory_id ||
+      !Number.isInteger(row.version) || row.version < 1) {
+    return errorEnvelope(503, "approved memory exact read unavailable", requestId);
+  }
+  const match = parseApprovedRow(row, deps.requestIsolation);
+  if (!match || match.record.memory_id !== parsed.data.memory_id ||
+      match.metadata.idempotency_key !== parsed.data.idempotency_key ||
+      match.record.scope !== parsed.data.scope || match.record.scope_id !== parsed.data.scope_id) {
+    return errorEnvelope(503, "approved memory exact read unavailable", requestId);
+  }
+  return successEnvelope({ ...lifecycleItem(match, lifecycleViews([match])), readback_status: "verified" }, requestId);
 }
 
 export async function handleApprovedMemorySearch(body: unknown, _auth: V2AuthContext, requestId: string,

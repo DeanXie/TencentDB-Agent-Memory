@@ -82,7 +82,198 @@ function exactReadFrom(rows: any[]) {
   };
 }
 
+function storedApprovedRow(input: any, isolation: { teamId: string; userId: string; agentId: string } = {
+  teamId: "team", userId: "user", agentId: "agent",
+}) {
+  const direct = input.admission.contract === "cmg/human-approved-memory-admission/v2";
+  const metadata = direct ? {
+    contract: "cmg/approved-working-memory-record/v2",
+    storage_status: "approved",
+    approved_payload: input.record,
+    write_payload_digest: input.admission.write_payload_digest,
+    authorization_type: input.admission.authorization_type,
+    command_id: input.admission.command_id,
+    source_digest: input.admission.source_digest,
+    authorization_digest: input.admission.authorization_digest,
+    admission_digest: input.admission.admission_digest,
+    idempotency_key: input.admission.idempotency_key,
+    stored_at: "2026-10-07T01:01:00.000Z",
+  } : {
+    contract: "cmg/approved-working-memory-record/v1",
+    storage_status: "approved",
+    approved_payload: input.record,
+    write_payload_digest: input.admission.write_payload_digest,
+    candidate_id: input.admission.candidate_id,
+    governance_digest: input.admission.governance_digest,
+    approval_request_id: input.admission.approval_request_id,
+    approval_request_digest: input.admission.approval_request_digest,
+    approval_decision_digest: input.admission.approval_decision_digest,
+    admission_digest: input.admission.admission_digest,
+    idempotency_key: input.admission.idempotency_key,
+    stored_at: "2026-10-07T01:01:00.000Z",
+  };
+  return {
+    record_id: input.record.memory_id,
+    content: input.record.content,
+    type: "instruction",
+    priority: 100,
+    scene_name: "approved-working-memory",
+    session_key: "session",
+    session_id: "session",
+    team_id: isolation.teamId,
+    task_id: "",
+    user_id: isolation.userId,
+    agent_id: isolation.agentId,
+    version: 1,
+    timestamp_str: input.admission.evaluated_at,
+    timestamp_start: "",
+    timestamp_end: "",
+    created_time: "2026-10-07T01:01:00.000Z",
+    updated_time: "2026-10-07T01:01:00.000Z",
+    metadata_json: JSON.stringify(metadata),
+  };
+}
+
 describe("approved Working Memory boundary", () => {
+  it("returns unavailable instead of not found when the exact read fails", async () => {
+    const input = approvedFixture();
+    const store = {
+      readL1RecordExact: async () => ({ status: "read_failed" as const }),
+      queryL1Records: async () => [],
+    } as unknown as IMemoryStore;
+    const result = await handleApprovedMemoryGet({
+      memory_id: input.record.memory_id,
+      idempotency_key: input.admission.idempotency_key,
+      scope: input.record.scope,
+      scope_id: input.record.scope_id,
+    }, { apiKey: "test", serviceId: "test" }, "get-read-failed", {
+      getStore: () => store,
+      requestIsolation: { teamId: "team", userId: "user", agentId: "agent", sessionId: "session" },
+    });
+
+    expect(result).toMatchObject({ code: 503, message: "approved memory exact read unavailable" });
+  });
+
+  it("returns not found only for an authoritative exact not_found result", async () => {
+    const input = approvedFixture();
+    let queryCalls = 0;
+    const store = {
+      readL1RecordExact: async () => ({ status: "not_found" as const }),
+      queryL1Records: async () => { queryCalls += 1; return []; },
+    } as unknown as IMemoryStore;
+    const result = await handleApprovedMemoryGet({ memory_id: input.record.memory_id,
+      idempotency_key: input.admission.idempotency_key, scope: input.record.scope, scope_id: input.record.scope_id },
+    { apiKey: "test", serviceId: "test" }, "get-not-found", {
+      getStore: () => store,
+      requestIsolation: { teamId: "team", userId: "user", agentId: "agent", sessionId: "session" },
+    });
+
+    expect(result).toMatchObject({ code: 404, message: "approved memory not found" });
+    expect(queryCalls).toBe(0);
+  });
+
+  it("fails closed when the Store lacks authoritative exact-read capability", async () => {
+    const input = approvedFixture();
+    let queryCalls = 0;
+    const store = {
+      queryL1Records: async () => { queryCalls += 1; return []; },
+    } as unknown as IMemoryStore;
+    const result = await handleApprovedMemoryGet({ memory_id: input.record.memory_id,
+      idempotency_key: input.admission.idempotency_key, scope: input.record.scope, scope_id: input.record.scope_id },
+    { apiKey: "test", serviceId: "test" }, "get-no-exact-capability", {
+      getStore: () => store,
+      requestIsolation: { teamId: "team", userId: "user", agentId: "agent", sessionId: "session" },
+    });
+
+    expect(result).toMatchObject({ code: 503, message: "approved memory exact read unavailable" });
+    expect(queryCalls).toBe(0);
+  });
+
+  it("returns one exact valid record without falling back to a list query", async () => {
+    const input = directFixture();
+    const row = storedApprovedRow(input);
+    let queryCalls = 0;
+    const store = {
+      readL1RecordExact: async () => ({ status: "found" as const, row }),
+      queryL1Records: async () => { queryCalls += 1; return [row]; },
+    } as unknown as IMemoryStore;
+    const result = await handleApprovedMemoryGet({ memory_id: input.record.memory_id,
+      idempotency_key: input.admission.idempotency_key, scope: input.record.scope, scope_id: input.record.scope_id },
+    { apiKey: "test", serviceId: "test" }, "get-found", {
+      getStore: () => store,
+      requestIsolation: { teamId: "team", userId: "user", agentId: "agent", sessionId: "session" },
+    });
+
+    expect(result).toMatchObject({ code: 0, data: { record: input.record, readback_status: "verified" } });
+    expect(queryCalls).toBe(0);
+  });
+
+  it("rejects a foreign-isolation exact record without leaking its content or metadata", async () => {
+    const input = directFixture();
+    const row = storedApprovedRow(input, { teamId: "foreign-team", userId: "foreign-user", agentId: "foreign-agent" });
+    row.content = "foreign secret content";
+    row.metadata_json = JSON.stringify({ secret: "foreign provenance secret" });
+    const store = {
+      readL1RecordExact: async () => ({ status: "found" as const, row }),
+      queryL1Records: async () => [],
+    } as unknown as IMemoryStore;
+    const result = await handleApprovedMemoryGet({ memory_id: input.record.memory_id,
+      idempotency_key: input.admission.idempotency_key, scope: input.record.scope, scope_id: input.record.scope_id },
+    { apiKey: "test", serviceId: "test" }, "get-foreign", {
+      getStore: () => store,
+      requestIsolation: { teamId: "team", userId: "user", agentId: "agent", sessionId: "session" },
+    });
+    const publicResult = JSON.stringify(result);
+
+    expect(result).toMatchObject({ code: 503, message: "approved memory exact read unavailable" });
+    for (const secret of ["foreign secret content", "foreign provenance secret", "foreign-team", "foreign-user", "foreign-agent"]) {
+      expect(publicResult).not.toContain(secret);
+    }
+  });
+
+  it("fails closed for malformed, wrong-id, or invalid-version exact found records", async () => {
+    const input = approvedFixture();
+    const valid = storedApprovedRow(input);
+    const malformedRows = [
+      undefined,
+      { ...valid, record_id: `wm_sha256_${"0".repeat(64)}` },
+      { ...valid, version: 0 },
+      { ...valid, metadata_json: "{}" },
+    ];
+    for (const row of malformedRows) {
+      const store = {
+        readL1RecordExact: async () => ({ status: "found" as const, row }),
+        queryL1Records: async () => [],
+      } as unknown as IMemoryStore;
+      const result = await handleApprovedMemoryGet({ memory_id: input.record.memory_id,
+        idempotency_key: input.admission.idempotency_key, scope: input.record.scope, scope_id: input.record.scope_id },
+      { apiKey: "test", serviceId: "test" }, "get-malformed", {
+        getStore: () => store,
+        requestIsolation: { teamId: "team", userId: "user", agentId: "agent", sessionId: "session" },
+      });
+      expect(result).toMatchObject({ code: 503, message: "approved memory exact read unavailable" });
+    }
+  });
+
+  it("fails closed before exact lookup when the Store reports degraded state", async () => {
+    const input = approvedFixture();
+    let exactReads = 0;
+    const store = {
+      isDegraded: () => true,
+      readL1RecordExact: async () => { exactReads += 1; return { status: "not_found" as const }; },
+      queryL1Records: async () => [],
+    } as unknown as IMemoryStore;
+    const result = await handleApprovedMemoryGet({ memory_id: input.record.memory_id,
+      idempotency_key: input.admission.idempotency_key, scope: input.record.scope, scope_id: input.record.scope_id },
+    { apiKey: "test", serviceId: "test" }, "get-degraded", {
+      getStore: () => store,
+      requestIsolation: { teamId: "team", userId: "user", agentId: "agent", sessionId: "session" },
+    });
+
+    expect(result).toMatchObject({ code: 503, message: "approved memory exact read unavailable" });
+    expect(exactReads).toBe(0);
+  });
+
   it("persists the frozen CMG direct v2 vector with the exact deterministic memory id", async () => {
     const input = directFixture();
     const rows: any[] = [];
@@ -349,6 +540,10 @@ describe("approved Working Memory boundary", () => {
     const input = approvedFixture();
     let persisted: any = null;
     const store = {
+      readL1RecordExact: async (recordId: string) => {
+        if (!persisted || persisted.record_id !== recordId) return { status: "not_found" as const };
+        return { status: "found" as const, row: persisted };
+      },
       queryL1Records: async () => persisted ? [persisted] : [],
       upsertL1: async (record: any) => { persisted = {
         record_id: record.id, content: record.content, type: record.type, priority: record.priority,

@@ -36,6 +36,23 @@ import type { StandaloneLLMConfig } from "../adapters/standalone/llm-runner.js";
  */
 export type DeployMode = "standalone" | "service";
 
+/**
+ * Non-secret identity binding for the sole caller allowed to submit direct-v2
+ * approved-memory writes. Session/turn/item lineage is intentionally excluded:
+ * those values change per accepted user request and are bound at request time.
+ */
+export interface DirectWriterAuthorityConfig {
+  serviceId: string;
+  projectId: string;
+  scope: "project";
+  scopeId: string;
+  isolation: {
+    teamId: string;
+    userId: string;
+    agentId: string;
+  };
+}
+
 export interface RedisConfig {
   host: string;
   port: number;
@@ -256,6 +273,19 @@ export interface GatewayConfig {
      */
     apiKey?: string;
     /**
+     * Expected non-secret authority for direct Admission v2 writes.
+     *
+     * All fields are required. Missing/incomplete configuration leaves this
+     * value undefined and direct-v2 writes fail closed. The existing
+     * `server.apiKey` remains the only credential.
+     *
+     * env: `TDAI_DIRECT_WRITER_SERVICE_ID`, `TDAI_DIRECT_WRITER_PROJECT_ID`,
+     *      `TDAI_DIRECT_WRITER_SCOPE`, `TDAI_DIRECT_WRITER_SCOPE_ID`, and
+     *      `TDAI_DIRECT_WRITER_{TEAM,USER,AGENT}_ID`
+     * yaml: `server.directWriterAuthority`
+     */
+    directWriterAuthority?: DirectWriterAuthorityConfig;
+    /**
      * Optional CORS allow-list.
      *
      * When empty (default), the gateway sends **no** `Access-Control-Allow-*`
@@ -428,6 +458,26 @@ export function loadGatewayConfig(overrides?: Partial<GatewayConfig>): GatewayCo
   // resolveCorsOrigins below: empty list means "send no CORS headers").
   const apiKey = env("TDAI_GATEWAY_API_KEY") ?? str(serverConfig, "apiKey");
   const corsOrigins = resolveCorsOrigins(serverConfig);
+  const directAuthorityConfig = obj(serverConfig, "directWriterAuthority");
+  const directServiceId = env("TDAI_DIRECT_WRITER_SERVICE_ID") ?? str(directAuthorityConfig, "serviceId");
+  const directProjectId = env("TDAI_DIRECT_WRITER_PROJECT_ID") ?? str(directAuthorityConfig, "projectId");
+  const directScope = env("TDAI_DIRECT_WRITER_SCOPE") ?? str(directAuthorityConfig, "scope");
+  const directScopeId = env("TDAI_DIRECT_WRITER_SCOPE_ID") ?? str(directAuthorityConfig, "scopeId");
+  const directIsolationConfig = obj(directAuthorityConfig, "isolation");
+  const directTeamId = env("TDAI_DIRECT_WRITER_TEAM_ID") ?? str(directIsolationConfig, "teamId");
+  const directUserId = env("TDAI_DIRECT_WRITER_USER_ID") ?? str(directIsolationConfig, "userId");
+  const directAgentId = env("TDAI_DIRECT_WRITER_AGENT_ID") ?? str(directIsolationConfig, "agentId");
+  const directWriterAuthority: DirectWriterAuthorityConfig | undefined =
+    directServiceId && directProjectId && directScope === "project" && directScopeId &&
+    directTeamId && directUserId && directAgentId
+      ? {
+          serviceId: directServiceId,
+          projectId: directProjectId,
+          scope: "project",
+          scopeId: directScopeId,
+          isolation: { teamId: directTeamId, userId: directUserId, agentId: directAgentId },
+        }
+      : undefined;
 
   // Data config (expand leading ~ to $HOME so Node.js fs/path can resolve it)
   const dataConfig = obj(fileConfig, "data");
@@ -728,7 +778,7 @@ export function loadGatewayConfig(overrides?: Partial<GatewayConfig>): GatewayCo
     deployMode,
     stateBackend,
     instanceId,
-    server: { port, host, apiKey, corsOrigins },
+    server: { port, host, apiKey, directWriterAuthority, corsOrigins },
     data: { baseDir },
     llm,
     memory,

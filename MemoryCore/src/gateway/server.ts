@@ -58,7 +58,7 @@ import { validateAndNormalizeRaw, SeedValidationError } from "../core/seed/input
 import { executeSeed } from "../core/seed/seed-runtime.js";
 import type { SeedProgress } from "../core/seed/types.js";
 import { handleV2Route, errorEnvelope, makeRequestId } from "./v2-router.js";
-import type { V2RouterDeps } from "./v2-router.js";
+import type { GatewayAuthState, V2RouterDeps } from "./v2-router.js";
 import { handleV3MetaRoute, V3_PREFIX } from "../metadata/router/v3-meta-router.js";
 import { handleInternalMetaRoute, V3_INTERNAL_PREFIX } from "../metadata/router/internal-meta-router.js";
 import { MetadataService } from "../metadata/service/metadata-service.js";
@@ -840,6 +840,7 @@ export class TdaiGateway {
     }
 
     try {
+      let gatewayAuthState: GatewayAuthState = "default_open";
       // ── /v2/instance/destroy — admin endpoint, gated by the v1-style
       //    Bearer apiKey only (no service-id / per-request envelope).
       //    When `server.apiKey` is unset this is open by default, matching
@@ -897,7 +898,9 @@ export class TdaiGateway {
       // is a no-op (default-open), matching the develop_server_test
       // baseline.
       if (pathname.startsWith("/v2/") || pathname.startsWith("/v3/")) {
-        if (!this.checkAuthForV2(req, res)) return;
+        const verified = this.checkAuthForV2(req, res);
+        if (!verified) return;
+        gatewayAuthState = verified;
       }
 
       const v2Deps: V2RouterDeps = {
@@ -911,6 +914,8 @@ export class TdaiGateway {
         stateBackend: this.stateBackend ?? undefined,
         pipelineWorker: this.pipelineWorker ?? undefined,
         logger: this.logger,
+        gatewayAuthState,
+        directWriterAuthority: this.config.server.directWriterAuthority,
         // `V3_STRICT_ISOLATION` controls only /v3 L0–L3 memory data-plane
         // strictness. Default OFF for local/integration; production should set it.
         v3StrictIsolation: resolveV3StrictIsolation(),
@@ -1099,13 +1104,15 @@ export class TdaiGateway {
    * Verify the `Authorization: Bearer <apiKey>` header against the configured
    * shared secret using a constant-time comparison.
    *
-   * When `server.apiKey` is unset (`undefined`), this returns `"ok"` without
+   * When `server.apiKey` is unset (`undefined`), this returns
+   * `"default_open"` without
    * inspecting the request — this is the documented default and matches the
    * pre-existing open behaviour. Operators are reminded of this at startup
    * via `logSecurityPosture`.
    *
    * Returns one of:
-   *   - `"ok"`            — auth disabled OR token matches; caller proceeds
+   *   - `"default_open"`  — auth disabled; legacy caller proceeds
+   *   - `"api_key_verified"` — configured token matched
    *   - `"missing"`       — Authorization header missing or not a Bearer token
    *   - `"invalid"`       — token present but did not match the configured key
    *
@@ -1113,9 +1120,9 @@ export class TdaiGateway {
    * appropriate 401 response (v1 plain-text via {@link checkAuth} or v2
    * envelope via {@link checkAuthForV2}).
    */
-  private verifyAuth(req: http.IncomingMessage): "ok" | "missing" | "invalid" {
+  private verifyAuth(req: http.IncomingMessage): GatewayAuthState | "missing" | "invalid" {
     const expected = this.config.server.apiKey;
-    if (!expected) return "ok"; // auth disabled — default behaviour
+    if (!expected) return "default_open"; // auth disabled — legacy default behaviour
 
     const header = req.headers["authorization"];
     if (typeof header !== "string" || !header.startsWith("Bearer ")) {
@@ -1125,7 +1132,7 @@ export class TdaiGateway {
     if (!provided || !safeEqual(provided, expected)) {
       return "invalid";
     }
-    return "ok";
+    return "api_key_verified";
   }
 
   /**
@@ -1135,7 +1142,7 @@ export class TdaiGateway {
    */
   private checkAuth(req: http.IncomingMessage, res: http.ServerResponse): boolean {
     const result = this.verifyAuth(req);
-    if (result === "ok") return true;
+    if (result === "api_key_verified" || result === "default_open") return true;
     sendError(
       res,
       401,
@@ -1154,16 +1161,16 @@ export class TdaiGateway {
    * The existing in-router `parseV2Auth` (which checks for non-empty Bearer
    * + `x-tdai-service-id`) is layered on top; this gate runs first.
    */
-  private checkAuthForV2(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+  private checkAuthForV2(req: http.IncomingMessage, res: http.ServerResponse): GatewayAuthState | null {
     const result = this.verifyAuth(req);
-    if (result === "ok") return true;
+    if (result === "api_key_verified" || result === "default_open") return result;
     const requestId = makeRequestId();
     const message =
       result === "missing"
         ? "Unauthorized: missing Bearer token"
         : "Unauthorized: invalid token";
     sendJson(res, 401, errorEnvelope(401, message, requestId));
-    return false;
+    return null;
   }
 
   /**

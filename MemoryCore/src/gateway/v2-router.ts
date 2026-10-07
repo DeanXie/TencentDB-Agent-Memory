@@ -22,6 +22,7 @@ import type { EmbeddingService } from "../core/store/embedding.js";
 import { createScopedStorageAdapter, type StorageAdapter } from "../core/storage/adapter.js";
 import { StoragePaths } from "../core/storage/types.js";
 import type { Logger } from "../core/types.js";
+import type { DirectWriterAuthorityConfig } from "./config.js";
 import type { IStateBackend } from "../core/state/types.js";
 import type { PipelineWorker } from "../services/pipeline-worker.js";
 import { executeMemorySearch } from "../core/tools/memory-search.js";
@@ -227,6 +228,8 @@ async function recordAudit(
 // Dependencies injected at mount time
 // ============================
 
+export type GatewayAuthState = "api_key_verified" | "default_open";
+
 export interface V2RouterDeps {
   /** Get the default IMemoryStore (standalone fallback). */
   getStore: () => IMemoryStore | undefined;
@@ -235,6 +238,10 @@ export interface V2RouterDeps {
   /** Get the default StorageAdapter (standalone fallback). */
   getStorage: () => StorageAdapter | undefined;
   logger: Logger;
+  /** Trusted result produced by server.ts after checking the configured API key. */
+  gatewayAuthState?: GatewayAuthState;
+  /** Non-secret expected identity for direct Admission v2 writes. */
+  directWriterAuthority?: DirectWriterAuthorityConfig;
 
   /**
    * Deploy mode of the gateway. Controls behaviors that diverge between
@@ -371,6 +378,93 @@ export function parseV2Auth(
     ["apiKey", authHeader.slice(7).trim()],
     ["serviceId", serviceId.trim()],
   ]) as V2AuthContext;
+}
+
+function nonEmpty(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function completeDirectWriterAuthority(value: unknown): value is DirectWriterAuthorityConfig {
+  if (!value || typeof value !== "object") return false;
+  const authority = value as Partial<DirectWriterAuthorityConfig>;
+  const isolation = authority.isolation;
+  return nonEmpty(authority.serviceId) && nonEmpty(authority.projectId) &&
+    authority.scope === "project" && nonEmpty(authority.scopeId) && !!isolation &&
+    nonEmpty(isolation.teamId) && nonEmpty(isolation.userId) && nonEmpty(isolation.agentId);
+}
+
+function requestIdentityValue(
+  body: Record<string, unknown>,
+  headers: Record<string, string | string[] | undefined>,
+  bodyKey: string,
+  headerKey: string,
+): string | null {
+  const rawHeader = headers[headerKey] ?? headers[headerKey.toLowerCase()];
+  const header = Array.isArray(rawHeader) ? rawHeader[0] : rawHeader;
+  const value = body[bodyKey] ?? header;
+  return nonEmpty(value) ? value.trim() : null;
+}
+
+function directAdmission(body: unknown): Record<string, unknown> | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const admission = (body as Record<string, unknown>).admission;
+  if (!admission || typeof admission !== "object" || Array.isArray(admission)) return null;
+  return (admission as Record<string, unknown>).contract === "cmg/human-approved-memory-admission/v2"
+    ? admission as Record<string, unknown>
+    : null;
+}
+
+/**
+ * Enforce the HTTP authority boundary before any Store is resolved. This is
+ * deliberately structural: the existing typed writer remains the sole owner
+ * of full Admission/payload validation after authority succeeds.
+ */
+function enforceDirectMemoryAuthority(
+  body: unknown,
+  auth: V2AuthContext,
+  headers: Record<string, string | string[] | undefined>,
+  deps: V2RouterDeps,
+  requestId: string,
+): ApiResponseEnvelope | null {
+  const admission = directAdmission(body);
+  if (!admission) return null;
+
+  // Older direct router unit tests mount the pure router without server.ts.
+  // The production mount always provides gatewayAuthState, including the
+  // explicit default_open state, so no HTTP request can bypass this branch.
+  if (deps.gatewayAuthState === undefined && deps.directWriterAuthority === undefined) return null;
+
+  const authority = deps.directWriterAuthority;
+  if (deps.gatewayAuthState !== "api_key_verified" || !completeDirectWriterAuthority(authority)) {
+    return errorEnvelope(403, "Direct writer authority unavailable", requestId);
+  }
+
+  const request = body as Record<string, unknown>;
+  const record = request.record && typeof request.record === "object" && !Array.isArray(request.record)
+    ? request.record as Record<string, unknown>
+    : {};
+  const safety = admission.safety && typeof admission.safety === "object" && !Array.isArray(admission.safety)
+    ? admission.safety as Record<string, unknown>
+    : {};
+  const provenance = safety.provenance && typeof safety.provenance === "object" && !Array.isArray(safety.provenance)
+    ? safety.provenance as Record<string, unknown>
+    : {};
+  const identity = {
+    teamId: requestIdentityValue(request, headers, "team_id", "x-tdai-team-id"),
+    userId: requestIdentityValue(request, headers, "user_id", "x-tdai-user-id"),
+    agentId: requestIdentityValue(request, headers, "agent_id", "x-tdai-agent-id"),
+    sessionId: requestIdentityValue(request, headers, "session_id", "x-tdai-session-id"),
+  };
+
+  const matches = auth.serviceId === authority.serviceId &&
+    provenance.project_id === authority.projectId &&
+    admission.scope === authority.scope && record.scope === authority.scope &&
+    admission.scope_id === authority.scopeId && record.scope_id === authority.scopeId &&
+    identity.teamId === authority.isolation.teamId &&
+    identity.userId === authority.isolation.userId &&
+    identity.agentId === authority.isolation.agentId &&
+    identity.sessionId !== null && identity.sessionId === provenance.session_id;
+  return matches ? null : errorEnvelope(403, "Direct writer authority mismatch", requestId);
 }
 
 // ============================
@@ -569,6 +663,26 @@ export async function handleV2Route(
   if (!auth) return true;
 
   try {
+    const headers = (req.headers ?? {}) as Record<string, string | string[] | undefined>;
+    const approvedWritePath = pathname === "/v2/approved-memory/write" || pathname === "/v3/approved-memory/write";
+    let body: unknown;
+    let bodyParsed = false;
+
+    // Direct-v2 authority must run before Store resolution. The body is parsed
+    // early only for the shared approved-memory write route; every other route
+    // keeps its previous resolution/parsing order.
+    if (method === "POST" && approvedWritePath) {
+      const bodyStart = Date.now();
+      body = await parseJsonBody(req);
+      bodyParsed = true;
+      perfMark("parseJsonBody", `dur=${Date.now() - bodyStart}ms len=${req.headers["content-length"] ?? "?"}`);
+      const authorityFailure = enforceDirectMemoryAuthority(body, auth, headers, deps, requestId);
+      if (authorityFailure) {
+        sendJson(res, authorityFailure.code, authorityFailure);
+        return true;
+      }
+    }
+
     // Pre-resolve per-request store/storage (service mode → per-instance, standalone → core singleton)
     const resolveStart = Date.now();
     const resolved = await resolveStoreForRequest(auth, deps);
@@ -583,11 +697,13 @@ export async function handleV2Route(
       getStorage: () => resolvedStorage,
     };
 
-    const bodyStart = Date.now();
-    const body = method === "GET"
-      ? Object.fromEntries(new URL(req.url ?? pathname, "http://localhost").searchParams.entries())
-      : await parseJsonBody(req);
-    perfMark("parseJsonBody", `dur=${Date.now() - bodyStart}ms len=${req.headers["content-length"] ?? "?"}`);
+    if (!bodyParsed) {
+      const bodyStart = Date.now();
+      body = method === "GET"
+        ? Object.fromEntries(new URL(req.url ?? pathname, "http://localhost").searchParams.entries())
+        : await parseJsonBody(req);
+      perfMark("parseJsonBody", `dur=${Date.now() - bodyStart}ms len=${req.headers["content-length"] ?? "?"}`);
+    }
 
     // Tenancy isolation — pulled from body (preferred) or x-tdai-* headers
     // and attached to the per-request deps so handlers can persist
@@ -600,7 +716,6 @@ export async function handleV2Route(
     //
     // /v3 走严格校验：必须同时提供 team_id + agent_id + user_id + session_id，
     // 缺任意一个直接 422，且不走 legacyCompatMode 退化。
-    const headers = (req.headers ?? {}) as Record<string, string | string[] | undefined>;
     const isoLegacyCompat = isV3 ? false : (deps.isolationConfig?.legacyCompatMode ?? false);
     const isoResolved = resolveIsolation(body as Record<string, unknown> | undefined, headers, {
       legacyCompatMode: isoLegacyCompat,

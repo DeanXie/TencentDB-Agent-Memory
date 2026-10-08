@@ -1,9 +1,13 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { createServer, request } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
 import type { IMemoryStore } from "../core/store/types.js";
 import { handleApprovedMemoryGet, handleApprovedMemorySearch, handleApprovedMemoryWrite } from "./approved-working-memory.js";
 import { handleV2Route } from "./v2-router.js";
+import { TdaiGateway } from "./server.js";
 
 const CMG_DIRECT_VECTOR_PATH = "F:\\AI\\CodexMemoryGovernance\\tests\\fixtures\\explicit-memory-contract-vectors.json";
 
@@ -133,6 +137,142 @@ function storedApprovedRow(input: any, isolation: { teamId: string; userId: stri
     metadata_json: JSON.stringify(metadata),
   };
 }
+
+// Reuse the loopback Gateway harness from approved-working-memory-authority.test.ts.
+// Never start/initialize the core: every Store/storage/embedding dependency is injected.
+async function exactGetHttp(store: IMemoryStore, body: unknown, isolation = {
+  teamId: "team", userId: "user", agentId: "agent",
+}) {
+  const gateway = new TdaiGateway({
+    server: { host: "127.0.0.1", port: 0, corsOrigins: [], apiKey: "test" } as any,
+    data: { baseDir: join(tmpdir(), "memorycore-exact-get-acceptance") } as any,
+  });
+  const core = (gateway as any).core;
+  core.getVectorStore = () => store;
+  core.getEmbeddingService = () => undefined;
+  core.getStorage = () => undefined;
+  (gateway as any).logger = { info() {}, warn() {}, error() {}, debug() {} };
+  const server = createServer((req, res) => {
+    void (gateway as any).handleRequest(req, res).catch(() => {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: "test server error" }));
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test listener unavailable");
+    return await new Promise<{ statusCode: number | undefined; body: any }>((resolve, reject) => {
+      const payload = JSON.stringify(body);
+      const req = request({
+        hostname: "127.0.0.1", port: address.port, path: "/v3/approved-memory/get", method: "POST",
+        headers: {
+          authorization: "Bearer test", "content-type": "application/json",
+          "content-length": Buffer.byteLength(payload), connection: "close",
+          "x-tdai-service-id": "test-service", "x-tdai-team-id": isolation.teamId,
+          "x-tdai-user-id": isolation.userId, "x-tdai-agent-id": isolation.agentId,
+          "x-tdai-session-id": "session",
+        },
+      }, (response) => {
+        void (async () => {
+          const chunks: Buffer[] = [];
+          for await (const chunk of response) chunks.push(Buffer.from(chunk));
+          resolve({ statusCode: response.statusCode, body: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
+        })().catch(reject);
+      });
+      req.on("error", reject);
+      req.setTimeout(5_000, () => req.destroy(new Error("test HTTP request timed out")));
+      req.end(payload);
+    });
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+}
+
+describe("approved Working Memory exact GET HTTP acceptance", () => {
+  // These assertions catch the historical query fallback, wrong reader arguments,
+  // repeated exact reads, and envelope-to-HTTP status regressions independently.
+  it.each([
+    { outcome: "found", http: 200, code: 0, reads: 1, assertions: 11 },
+    { outcome: "not_found", http: 404, code: 404, reads: 1, assertions: 10 },
+    { outcome: "read_failed", http: 503, code: 503, reads: 1, assertions: 11 },
+    { outcome: "missing_capability", http: 503, code: 503, reads: 0, assertions: 10 },
+    { outcome: "malformed", http: 503, code: 503, reads: 1, assertions: 11 },
+    { outcome: "unexpected_status", http: 503, code: 503, reads: 1, assertions: 11 },
+    { outcome: "thrown_read", http: 503, code: 503, reads: 1, assertions: 11 },
+  ])("exact GET $outcome returns HTTP $http with exact calls and zero fallback", async ({ outcome, http, code, reads, assertions }) => {
+    expect.assertions(assertions);
+    const input = directFixture();
+    const row = storedApprovedRow(input);
+    const results: Record<string, unknown> = {
+      found: { status: "found", row }, not_found: { status: "not_found" },
+      read_failed: { status: "read_failed" }, malformed: { status: "found" },
+      unexpected_status: { status: "unavailable" },
+    };
+    const exactReader = vi.fn(async (_recordId: string) => {
+      if (outcome === "thrown_read") throw new Error("synthetic exact transport failure");
+      return results[outcome];
+    });
+    // All existing L1 query/enumeration/search entrances in IMemoryStore.
+    // There are no separate listL1/scanL1 interfaces to invent here.
+    const fallbacks = {
+      countL1: vi.fn(async () => 1),
+      queryL1Records: vi.fn(async () => [row]),
+      getAllL1Texts: vi.fn(async () => [{ record_id: row.record_id, content: row.content, updated_time: row.updated_time }]),
+      searchL1Vector: vi.fn(async () => []),
+      searchL1Fts: vi.fn(async () => []),
+      searchL1Hybrid: vi.fn(async () => []),
+    };
+    const store = {
+      ...fallbacks, ...(outcome === "missing_capability" ? {} : { readL1RecordExact: exactReader }),
+    } as unknown as IMemoryStore;
+    const response = await exactGetHttp(store, {
+      memory_id: input.record.memory_id, idempotency_key: input.admission.idempotency_key,
+      scope: input.record.scope, scope_id: input.record.scope_id,
+    });
+
+    expect(response.statusCode).toBe(http);
+    expect(response.body.code).toBe(code);
+    expect(exactReader).toHaveBeenCalledTimes(reads);
+    if (reads === 1) expect(exactReader).toHaveBeenCalledWith(input.record.memory_id);
+    for (const fallback of Object.values(fallbacks)) expect(fallback).toHaveBeenCalledTimes(0);
+    if (outcome === "found") {
+      expect(response.body.data).toMatchObject({ record: input.record, record_version: 1, readback_status: "verified" });
+    } else if (http === 503) {
+      expect(response.body).toEqual({ code: 503, message: "approved memory exact read unavailable", request_id: expect.any(String) });
+    }
+  });
+
+  it.each(["teamId", "userId", "agentId"] as const)(
+    "exact GET rejects a valid foreign %s alone without leaking content or metadata",
+    async (field) => {
+      expect.assertions(11);
+      const input = directFixture();
+      const matchingIsolation = { teamId: "team", userId: "user", agentId: "agent", [field]: `foreign-${field}` };
+      const row = storedApprovedRow(input, matchingIsolation);
+      const exactReader = vi.fn(async (_recordId: string) => ({ status: "found" as const, row }));
+      const store = { readL1RecordExact: exactReader } as unknown as IMemoryStore;
+      const body = { memory_id: input.record.memory_id, idempotency_key: input.admission.idempotency_key,
+        scope: input.record.scope, scope_id: input.record.scope_id };
+
+      // Positive control proves this exact same row satisfies every other contract.
+      const matching = await exactGetHttp(store, body, matchingIsolation);
+      expect(matching.statusCode).toBe(200);
+      expect(matching.body.data).toMatchObject({ record: input.record, record_version: 1, readback_status: "verified" });
+      const foreign = await exactGetHttp(store, body);
+      expect(foreign.statusCode).toBe(503);
+      expect(foreign.body).toEqual({ code: 503, message: "approved memory exact read unavailable", request_id: expect.any(String) });
+      for (const sensitive of [row.content, row.metadata_json, matchingIsolation[field],
+        input.admission.authorization_digest, input.admission.admission_digest, input.admission.idempotency_key]) {
+        expect(JSON.stringify(foreign.body)).not.toContain(sensitive);
+      }
+      expect(exactReader.mock.calls).toEqual([[input.record.memory_id], [input.record.memory_id]]);
+    },
+  );
+});
 
 describe("approved Working Memory boundary", () => {
   it("returns unavailable instead of not found when the exact read fails", async () => {

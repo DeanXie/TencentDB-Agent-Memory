@@ -286,6 +286,14 @@ export interface ConfigProviderRuntimeObservation {
   readonly selectedSource: "UNKNOWN" | "FACTORY_UNVERIFIED" | "BUILTIN_LOCAL_FALLBACK";
 }
 
+/** In-process selection diagnostics, never initialization/health or L4 proof. */
+export interface StateBackendRuntimeObservation {
+  readonly configuredStateBackend: "local" | "redis" | "UNKNOWN";
+  /** Built-in Local instance/prototype match only; private implementations stay UNKNOWN. */
+  readonly constructedStateBackend: "local" | "UNKNOWN";
+  readonly selectionStatus: "UNKNOWN" | "ACCEPTED";
+}
+
 export class TdaiGateway {
   private config: GatewayConfig;
   private logger: Logger;
@@ -297,6 +305,8 @@ export class TdaiGateway {
 
   // ── Integrated services (Scanner + Worker) ──
   private stateBackend: IStateBackend | null = null;
+  private stateBackendObservation: Readonly<StateBackendRuntimeObservation> | null = null;
+  private observedStateBackend: IStateBackend | null = null;
   private timerScanner: TimerScanner | null = null;
   private pipelineWorker: PipelineWorker | null = null;
   /**
@@ -434,6 +444,18 @@ export class TdaiGateway {
       factoryStatus: "UNKNOWN",
       selectionStatus: "UNKNOWN",
       selectedSource: "UNKNOWN",
+    });
+  }
+
+  /** Acceptance follows the existing assignment order, not Gateway readiness. */
+  getStateBackendObservation(): Readonly<StateBackendRuntimeObservation> {
+    if (this.stateBackendObservation && this.stateBackend === this.observedStateBackend) {
+      return this.stateBackendObservation;
+    }
+    return Object.freeze({
+      configuredStateBackend: "UNKNOWN",
+      constructedStateBackend: "UNKNOWN",
+      selectionStatus: "UNKNOWN",
     });
   }
 
@@ -824,6 +846,8 @@ export class TdaiGateway {
       this.logger.info("Timer Scanner stopped");
     }
     if (this.stateBackend) {
+      this.stateBackendObservation = null;
+      this.observedStateBackend = null;
       await this.stateBackend.destroy?.();
       this.logger.info("State Backend closed");
     }
@@ -1675,7 +1699,12 @@ export class TdaiGateway {
     this.logger.info(`Starting integrated services (deployMode=${this.config.deployMode}, state_backend=${backendType})...`);
 
     // 1. Create State Backend
-    const { createStateBackend } = await import("../core/state/index.js");
+    this.stateBackendObservation = Object.freeze({
+      configuredStateBackend: backendType,
+      constructedStateBackend: "UNKNOWN",
+      selectionStatus: "UNKNOWN",
+    });
+    const { createStateBackend, LocalStateBackend } = await import("../core/state/index.js");
     this.stateBackend = await createStateBackend({
       type: backendType,
       local: backendType === "local" ? {
@@ -1756,6 +1785,18 @@ export class TdaiGateway {
         ["db", this.config.redis.db],
         ["keyPrefix", this.config.redis.keyPrefix],
       ]) : undefined,
+    });
+    let constructedStateBackend: StateBackendRuntimeObservation["constructedStateBackend"] = "UNKNOWN";
+    try {
+      if (typeof LocalStateBackend === "function" && this.stateBackend instanceof LocalStateBackend) {
+        constructedStateBackend = "local";
+      }
+    } catch { /* Diagnostic inspection must not change the accepted business result. */ }
+    this.observedStateBackend = this.stateBackend;
+    this.stateBackendObservation = Object.freeze({
+      configuredStateBackend: backendType,
+      constructedStateBackend,
+      selectionStatus: this.stateBackend !== null && typeof this.stateBackend === "object" ? "ACCEPTED" : "UNKNOWN",
     });
     this.logger.info(`State Backend created (${backendType})`);
 

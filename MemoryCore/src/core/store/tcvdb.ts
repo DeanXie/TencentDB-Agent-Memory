@@ -85,6 +85,17 @@ export interface TcvdbMemoryStoreConfig {
   bm25Encoder?: BM25LocalEncoder;
 }
 
+/** Per-init diagnostics only, not store health or trusted runtime evidence. */
+export interface TcvdbInitializationObservation {
+  readonly attempt: number;
+  readonly status: "UNKNOWN" | "SUCCEEDED" | "FAILED";
+}
+
+type InitializationAttempt = {
+  attempt: number;
+  status: TcvdbInitializationObservation["status"];
+};
+
 const TAG = "[memory-tdai][tcvdb]";
 
 /** Base collection suffixes (prefixed with database name at construction time). */
@@ -252,6 +263,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
   private readonly memoryPromptSettingLogsCollection: string;
   private readonly memoryGenerationRefsCollection: string;
   private degraded = false;
+  #initializationObservation: InitializationAttempt = { attempt: 0, status: "UNKNOWN" };
 
   /** Promise that resolves when async init completes. */
   private _initPromise: Promise<void> | undefined;
@@ -286,16 +298,25 @@ export class TcvdbMemoryStore implements IMemoryStore {
   // ── Lifecycle ────────────────────────────────────────────
 
   async init(_providerInfo?: EmbeddingProviderInfo): Promise<StoreInitResult> {
+    const observation: InitializationAttempt = {
+      attempt: this.#initializationObservation.attempt + 1, status: "UNKNOWN",
+    };
+    this.#initializationObservation = observation;
     // TCVDB init is async (HTTP). We store the promise so _ensureInit()
     // can also await it as a defensive fallback in each data method.
-    this._initPromise = this._initAsync();
+    this._initPromise = this._initAsync(observation);
     try {
       await this._initPromise;
     } catch (err) {
       this.logger?.error(`${TAG} Async init failed: ${err instanceof Error ? err.message : String(err)}`);
       this.degraded = true;
+      if (this.#initializationObservation === observation) observation.status = "FAILED";
     }
     return { needsReindex: false };
+  }
+
+  getInitializationObservation(): Readonly<TcvdbInitializationObservation> {
+    return Object.freeze({ ...this.#initializationObservation });
   }
 
   /**
@@ -376,7 +397,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
     }
   }
 
-  private async _initAsync(): Promise<void> {
+  private async _initAsync(observation: InitializationAttempt): Promise<void> {
     try {
       // Create database (idempotent — returns true if just created, false if already existed)
       const dbCreated = await this.client.createDatabase();
@@ -571,6 +592,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
       ]);
 
       this.logger?.debug?.(`${TAG} Initialized: db=${this.client.getDatabase()}, model=${this.embeddingModel}`);
+      if (this.#initializationObservation === observation) observation.status = "SUCCEEDED";
     } catch (err) {
       // 15201 = database already exists — benign race in createDatabase().
       // 15202 (collection already exists) is now handled inside TcvdbClient.createCollection(),
@@ -581,6 +603,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
       }
       this.logger?.error(`${TAG} Init failed: ${err instanceof Error ? err.message : String(err)}`);
       this.degraded = true;
+      if (this.#initializationObservation === observation) observation.status = "FAILED";
     }
   }
 

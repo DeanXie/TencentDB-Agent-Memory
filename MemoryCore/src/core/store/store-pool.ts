@@ -22,7 +22,7 @@ import type { IMemoryStore, StoreLogger } from "./types.js";
 import type { EmbeddingService } from "./embedding.js";
 import { createEmbeddingService, NoopEmbeddingService } from "./embedding.js";
 import { VectorStore } from "./sqlite.js";
-import { TcvdbMemoryStore } from "./tcvdb.js";
+import { TcvdbMemoryStore, type TcvdbInitializationObservation } from "./tcvdb.js";
 import { TcvdbSkillStore } from "./tcvdb-skill-store.js";
 import { createBM25Encoder } from "./bm25-local.js";
 import type { BM25LocalEncoder } from "./bm25-local.js";
@@ -42,11 +42,27 @@ export interface PooledStore {
   bm25Encoder?: BM25LocalEncoder;
 }
 
+/** In-process diagnostics only; neither runtime attestation nor qualification. */
+export interface StoreRuntimeObservation {
+  readonly instanceId: string;
+  /** Monotonic within this StorePool; not an identity across pools or restarts. */
+  readonly generation: number;
+  readonly configuredMode: StoreMode;
+  readonly constructedBackend: StoreMode;
+  readonly initStatus: "UNKNOWN" | "SUCCEEDED" | "FAILED";
+}
+
 interface PoolEntry {
   pooledStore: PooledStore;
   /** VDB 配置指纹, 用于检测配置变更 */
   configFingerprint: string;
   lastAccessedAt: number;
+  generation: number;
+  configuredMode: StoreMode;
+  constructedBackend: StoreMode;
+  initStatus: StoreRuntimeObservation["initStatus"];
+  /** The TCVDB init attempt initiated by this entry; later re-init is drift. */
+  initializationAttempt?: number;
 }
 
 interface Logger {
@@ -89,6 +105,7 @@ export interface StorePoolOptions {
 
 export class StorePool {
   private pool = new Map<string, PoolEntry>();
+  private nextGeneration = 0;
   private maxStores: number;
   readonly mode: StoreMode;
   private memoryCfg: MemoryTdaiConfig;
@@ -193,15 +210,21 @@ export class StorePool {
     }
 
     // 创建新 Store
+    const constructedBackend = this.mode === "tcvdb" && vdbConfig ? "tcvdb" : "sqlite";
     const pooledStore = this.mode === "tcvdb" && vdbConfig
       ? this.createTcvdbStore(vdbConfig)
       : this.createSqliteStore(instanceId);
 
-    this.pool.set(instanceId, {
+    const entry: PoolEntry = {
       pooledStore,
       configFingerprint: fingerprint,
       lastAccessedAt: now,
-    });
+      generation: ++this.nextGeneration,
+      configuredMode: this.mode,
+      constructedBackend,
+      initStatus: "UNKNOWN",
+    };
+    this.pool.set(instanceId, entry);
 
     const storeDesc = this.mode === "tcvdb" && vdbConfig
       ? `${vdbConfig.url} / ${vdbConfig.database}`
@@ -212,12 +235,44 @@ export class StorePool {
 
     // 初始化 Store (建表/检查连接)
     try {
-      await pooledStore.store.init();
+      const initialization = pooledStore.store.init();
+      if (constructedBackend === "tcvdb") {
+        entry.initializationAttempt = this.tcvdbInitializationObservation(pooledStore.store)?.attempt;
+      }
+      const result = await initialization;
+      if (this.pool.get(instanceId) === entry) {
+        if (constructedBackend === "tcvdb") {
+          const observation = this.tcvdbInitializationObservation(pooledStore.store);
+          entry.initStatus = observation && observation.attempt === entry.initializationAttempt
+            ? observation.status : "UNKNOWN";
+        } else {
+          entry.initStatus = this.sqliteInitializationStatus(pooledStore.store, result);
+        }
+      }
     } catch (e) {
+      if (this.pool.get(instanceId) === entry) entry.initStatus = "FAILED";
       this.logger.warn(`${TAG} Store init failed for ${instanceId}: ${e}`);
     }
 
     return pooledStore;
+  }
+
+  /** A detached snapshot of the current entry, or null after removal/absence. */
+  getStoreObservation(instanceId: string): Readonly<StoreRuntimeObservation> | null {
+    const entry = this.pool.get(instanceId);
+    if (!entry) return null;
+    let initStatus = entry.initStatus;
+    if (entry.constructedBackend === "tcvdb" && entry.initializationAttempt !== undefined) {
+      const observation = this.tcvdbInitializationObservation(entry.pooledStore.store);
+      if (!observation || observation.attempt !== entry.initializationAttempt) initStatus = "UNKNOWN";
+    }
+    return Object.freeze({
+      instanceId,
+      generation: entry.generation,
+      configuredMode: entry.configuredMode,
+      constructedBackend: entry.constructedBackend,
+      initStatus,
+    });
   }
 
   /**
@@ -415,6 +470,30 @@ export class StorePool {
   // ════════════════════════════════════════════════════════
   // Internal — Common
   // ════════════════════════════════════════════════════════
+
+  private tcvdbInitializationObservation(store: IMemoryStore): Readonly<TcvdbInitializationObservation> | null {
+    try {
+      const observation = (store as Partial<Pick<TcvdbMemoryStore, "getInitializationObservation">>)
+        .getInitializationObservation?.();
+      if (!observation) return null;
+      const { attempt, status } = observation;
+      if (!Number.isSafeInteger(attempt) || attempt < 1 ||
+          (status !== "UNKNOWN" && status !== "SUCCEEDED" && status !== "FAILED")) return null;
+      return { attempt, status };
+    } catch { return null; }
+  }
+
+  private sqliteInitializationStatus(store: IMemoryStore, result: unknown): StoreRuntimeObservation["initStatus"] {
+    try {
+      // For a freshly constructed SQLite store, all init failure returns set
+      // degraded=true; the normal return follows completion of initSchema().
+      const degraded = store.isDegraded?.();
+      if (degraded === true) return "FAILED";
+      if (degraded === false && result !== null && typeof result === "object" &&
+          typeof (result as { needsReindex?: unknown }).needsReindex === "boolean") return "SUCCEEDED";
+    } catch { /* Missing or unreadable diagnostic evidence never changes init behavior. */ }
+    return "UNKNOWN";
+  }
 
   private computeFingerprint(cfg: VdbConfig): string {
     return `tcvdb:${cfg.url}|${cfg.database}|${cfg.apiKey}`;

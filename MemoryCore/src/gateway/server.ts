@@ -276,6 +276,16 @@ function safeEqual(a: string, b: string): boolean {
 // Gateway Server
 // ============================
 
+/** Selection-path diagnostics only; not source validity, readiness or attestation. */
+export interface ConfigProviderRuntimeObservation {
+  readonly configuredDeployMode: GatewayConfig["deployMode"];
+  readonly factoryCallAttempted: boolean;
+  readonly factoryStatus: "UNKNOWN" | "PENDING" | "RETURNED" | "THREW";
+  readonly selectionStatus: "UNKNOWN" | "ACCEPTED";
+  /** A factory result has no independently verified implementation identity. */
+  readonly selectedSource: "UNKNOWN" | "FACTORY_UNVERIFIED" | "BUILTIN_LOCAL_FALLBACK";
+}
+
 export class TdaiGateway {
   private config: GatewayConfig;
   private logger: Logger;
@@ -298,6 +308,8 @@ export class TdaiGateway {
 
   // ── Instance config & Store pool (multi-instance VDB) ──
   private configProvider: InstanceConfigProvider | null = null;
+  private configProviderObservation: Readonly<ConfigProviderRuntimeObservation> | null = null;
+  private observedConfigProvider: InstanceConfigProvider | null = null;
   private storePool: StorePool | null = null;
   private quotaManager: import("../core/quota/quota-manager.js").QuotaManager | null = null;
   private statefulPipelineManager: StatefulPipelineManager | null = null;
@@ -405,6 +417,23 @@ export class TdaiGateway {
             });
         },
       },
+    });
+  }
+
+  /** Detached frozen scalars. Acceptance does not prove source usability or L4 trust.
+   * Repeated startup follows the existing assignment order; cache refresh does
+   * not select another provider. No Gateway running/healthy claim is made.
+   */
+  getConfigProviderObservation(): Readonly<ConfigProviderRuntimeObservation> {
+    if (this.configProviderObservation && this.configProvider === this.observedConfigProvider) {
+      return this.configProviderObservation;
+    }
+    return Object.freeze({
+      configuredDeployMode: this.config.deployMode,
+      factoryCallAttempted: false,
+      factoryStatus: "UNKNOWN",
+      selectionStatus: "UNKNOWN",
+      selectedSource: "UNKNOWN",
     });
   }
 
@@ -1742,15 +1771,29 @@ export class TdaiGateway {
     // Optional deployment adapters are loaded dynamically. When unavailable,
     // standalone falls back to LocalConfigSource + NoopQuotaReporter; service
     // mode fails fast because it requires deployment-specific adapters.
+    const pendingObservation: ConfigProviderRuntimeObservation = {
+      configuredDeployMode: this.config.deployMode,
+      factoryCallAttempted: false, factoryStatus: "PENDING", selectionStatus: "UNKNOWN", selectedSource: "UNKNOWN",
+    };
+    let factoryCallAttempted = false;
+    let factoryStatus: ConfigProviderRuntimeObservation["factoryStatus"] = "PENDING";
+    let selectedSource: ConfigProviderRuntimeObservation["selectedSource"] = "FACTORY_UNVERIFIED";
+    this.configProviderObservation = Object.freeze({ ...pendingObservation });
     let adapterDeps: { configSource: import("../core/abstractions/index.js").IConfigSource; quotaReporter: import("../core/abstractions/index.js").IQuotaReporter };
     try {
       const { createAdapterDeps } = await import("../integrations/factory.js");
+      factoryCallAttempted = true;
+      this.configProviderObservation = Object.freeze({ ...pendingObservation, factoryCallAttempted });
       adapterDeps = await createAdapterDeps({
         deployMode: this.config.deployMode,
         sharkBaseUrl: this.config.shark.baseUrl,
         logger: this.logger,
       });
+      factoryStatus = "RETURNED";
+      this.configProviderObservation = Object.freeze({ ...pendingObservation, factoryCallAttempted, factoryStatus });
     } catch (err) {
+      factoryStatus = "THREW";
+      this.configProviderObservation = Object.freeze({ ...pendingObservation, factoryCallAttempted, factoryStatus });
       if (this.config.deployMode === "service") {
         throw new Error(
           `[gateway] deployMode=service requires src/integrations/ (private submodule), ` +
@@ -1768,6 +1811,7 @@ export class TdaiGateway {
         configSource: new LocalConfigSource(this.logger),
         quotaReporter: new NoopQuotaReporter(),
       };
+      selectedSource = "BUILTIN_LOCAL_FALLBACK";
     }
 
     this.configProvider = new InstanceConfigProvider({
@@ -1776,6 +1820,12 @@ export class TdaiGateway {
       cosBufferMs: this.config.shark.cosBufferMs,
       maxInstances: this.config.shark.maxInstances,
       logger: this.logger,
+    });
+
+    this.observedConfigProvider = this.configProvider;
+    this.configProviderObservation = Object.freeze({
+      configuredDeployMode: pendingObservation.configuredDeployMode,
+      factoryCallAttempted, factoryStatus, selectionStatus: "ACCEPTED", selectedSource,
     });
 
     // 1.2.1. Create QuotaManager (service mode only — in standalone the Noop

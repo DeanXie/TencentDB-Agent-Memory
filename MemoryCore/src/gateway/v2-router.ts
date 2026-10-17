@@ -230,13 +230,27 @@ async function recordAudit(
 
 export type GatewayAuthState = "api_key_verified" | "default_open";
 
+/** Request-local diagnostics only: deployment default and wrapper construction, never backend attestation. */
+export interface ProfileScopedStorageObservation {
+  readonly configuredStorageTarget: "LOCAL_DEFAULT" | "COS_DEFAULT" | "UNKNOWN";
+  readonly baseAdapterStatus: "RESOLVED" | "UNKNOWN";
+  readonly selectedAdapterKind: "SCOPED_WRAPPER" | "UNKNOWN";
+  readonly backendImplementationIdentity: "UNKNOWN";
+  readonly scopeShape: "TEAM_AGENT" | "USER_AGENT_FALLBACK" | "UNKNOWN";
+  readonly selectionStatus: "ACCEPTED" | "UNKNOWN";
+}
+
 export interface V2RouterDeps {
   /** Get the default IMemoryStore (standalone fallback). */
   getStore: () => IMemoryStore | undefined;
+  /** Internal request-local notification at actual Approved Memory Store use; never an authority. */
+  observeApprovedMemoryStoreSelection?: (store: IMemoryStore | undefined) => void;
   /** Get the default EmbeddingService (standalone fallback). */
   getEmbedding: () => EmbeddingService | undefined;
   /** Get the default StorageAdapter (standalone fallback). */
   getStorage: () => StorageAdapter | undefined;
+  /** Optional scalar observation channel; errors must never affect Profile operations. */
+  observeProfileStorageSelection?: (selection: Readonly<ProfileScopedStorageObservation>) => void;
   logger: Logger;
   /** Trusted result produced by server.ts after checking the configured API key. */
   gatewayAuthState?: GatewayAuthState;
@@ -692,7 +706,12 @@ export async function handleV2Route(
     // Wrap deps so handlers use the resolved per-instance resources
     const resolvedDeps: V2RouterDeps = {
       ...deps,
-      getStore: () => resolved.store,
+      getStore: () => {
+        if (/^\/v[23]\/approved-memory\/(?:get|write|search)$/.test(pathname)) {
+          try { deps.observeApprovedMemoryStoreSelection?.(resolved.store); } catch { /* Observation cannot affect the Handler. */ }
+        }
+        return resolved.store;
+      },
       getEmbedding: () => resolved.embedding,
       getStorage: () => resolvedStorage,
     };
@@ -1671,12 +1690,39 @@ function buildIsolationStoragePrefix(isolation: RequestIsolation): string {
   return `profiles/${encodeURIComponent(buildIsolationScope(isolation))}/`;
 }
 
-function scopedProfileStorage(storage: StorageAdapter, isolation?: RequestIsolation): StorageAdapter {
+function scopedProfileStorage(storage: StorageAdapter, isolation?: RequestIsolation, deps?: V2RouterDeps): StorageAdapter {
   // Direct unit callers may not go through handleV2Route and therefore do not
   // have requestIsolation attached. Keep that legacy path at root; real HTTP
   // requests always resolve to either explicit ids or the `default` bucket.
   if (!isolation) return storage;
-  return createScopedStorageAdapter(storage, buildIsolationStoragePrefix(isolation));
+  const selected = createScopedStorageAdapter(storage, buildIsolationStoragePrefix(isolation));
+  try {
+    const observer = deps?.observeProfileStorageSelection;
+    if (typeof observer === "function") {
+      // Inspect only own data descriptors; diagnostics must not invoke getters.
+      const team = Object.getOwnPropertyDescriptor(isolation, "teamId");
+      const user = Object.getOwnPropertyDescriptor(isolation, "userId");
+      const agent = Object.getOwnPropertyDescriptor(isolation, "agentId");
+      let scopeShape: ProfileScopedStorageObservation["scopeShape"] = "UNKNOWN";
+      if (agent && "value" in agent && typeof agent.value === "string" && agent.value) {
+        // Follow the existing team || user || default branch before checking
+        // its type. A truthy nonstring team is not an absent team.
+        if (team && "value" in team && team.value) {
+          if (typeof team.value === "string") scopeShape = "TEAM_AGENT";
+        } else if ((!team ? !("teamId" in isolation) : "value" in team)
+          && user && "value" in user && typeof user.value === "string" && user.value) {
+          scopeShape = "USER_AGENT_FALLBACK";
+        }
+      }
+      observer(Object.freeze({
+        configuredStorageTarget: deps?.deployMode === "service" ? "COS_DEFAULT"
+          : deps?.deployMode === "standalone" ? "LOCAL_DEFAULT" : "UNKNOWN",
+        baseAdapterStatus: "RESOLVED", selectedAdapterKind: "SCOPED_WRAPPER",
+        backendImplementationIdentity: "UNKNOWN", scopeShape, selectionStatus: "ACCEPTED",
+      }));
+    }
+  } catch { /* Observation is best-effort and cannot change the selected adapter or error path. */ }
+  return selected;
 }
 
 function md5Hex(text: string): string {
@@ -1888,7 +1934,7 @@ async function handleScenarioLs(body: unknown, _auth: V2AuthContext, requestId: 
 
   const baseStorage = deps.getStorage();
   if (!baseStorage) return errorEnvelope(503, "Storage not available", requestId);
-  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation);
+  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation, deps);
 
   const prefix = path_prefix
     ? `${StoragePaths.sceneBlocksDir}${path_prefix}`
@@ -1955,7 +2001,7 @@ async function handleScenarioCount(body: unknown, _auth: V2AuthContext, requestI
 
   const baseStorage = deps.getStorage();
   if (!baseStorage) return errorEnvelope(503, "Storage not available", requestId);
-  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation);
+  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation, deps);
   const prefix = path_prefix
     ? `${StoragePaths.sceneBlocksDir}${path_prefix}`
     : StoragePaths.sceneBlocksDir;
@@ -1971,7 +2017,7 @@ async function handleScenarioRead(body: unknown, _auth: V2AuthContext, requestId
 
   const baseStorage = deps.getStorage();
   if (!baseStorage) return errorEnvelope(503, "Storage not available", requestId);
-  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation);
+  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation, deps);
 
   const key = `${StoragePaths.sceneBlocksDir}${path}`;
   const content = await storage.readFile(key);
@@ -2036,7 +2082,7 @@ async function handleScenarioWrite(body: unknown, _auth: V2AuthContext, requestI
 
   const baseStorage = deps.getStorage();
   if (!baseStorage) return errorEnvelope(503, "Storage not available", requestId);
-  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation);
+  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation, deps);
 
   const key = `${StoragePaths.sceneBlocksDir}${path}`;
 
@@ -2108,7 +2154,7 @@ async function handleScenarioRm(body: unknown, _auth: V2AuthContext, requestId: 
 
   const baseStorage = deps.getStorage();
   if (!baseStorage) return errorEnvelope(503, "Storage not available", requestId);
-  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation);
+  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation, deps);
 
   const key = `${StoragePaths.sceneBlocksDir}${path}`;
   // Collect filenames to delete from VDB (single file or all files under a directory)
@@ -2152,7 +2198,7 @@ async function handleScenarioRm(body: unknown, _auth: V2AuthContext, requestId: 
 async function handleCoreRead(_body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
   const baseStorage = deps.getStorage();
   if (!baseStorage) return errorEnvelope(503, "Storage not available", requestId);
-  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation);
+  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation, deps);
 
   deps.logger.debug?.(`${TAG} [core/read] storage.type=${storage.type}, key="${StoragePaths.persona}"`);
   const content = await storage.readFile(StoragePaths.persona);
@@ -2196,7 +2242,7 @@ async function handleCoreCount(body: unknown, _auth: V2AuthContext, requestId: s
 
   const baseStorage = deps.getStorage();
   if (!baseStorage) return errorEnvelope(503, "Storage not available", requestId);
-  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation);
+  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation, deps);
   const content = await storage.readFile(StoragePaths.persona);
   return successEnvelope<CountData>({ total: content ? 1 : 0 }, requestId);
 }
@@ -2208,7 +2254,7 @@ async function handleCoreWrite(body: unknown, _auth: V2AuthContext, requestId: s
 
   const baseStorage = deps.getStorage();
   if (!baseStorage) return errorEnvelope(503, "Storage not available", requestId);
-  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation);
+  const storage = scopedProfileStorage(baseStorage, deps.requestIsolation, deps);
 
   // Normalize before persistence: persona body must NOT contain Scene Navigation
   // (a derived section rebuilt from scene_index.json) or stray surrounding

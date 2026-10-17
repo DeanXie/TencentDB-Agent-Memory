@@ -149,6 +149,48 @@ beforeEach(() => {
   boundary.clients.length = 0;
 });
 
+describe("StorePool exact request Store matching", () => {
+  const match = (instance: StorePool, id: string, store: unknown) =>
+    (instance as any).getMatchingStoreObservation?.(id, store) ?? null;
+
+  it("matches only the actual current Entry Store reference", async () => {
+    const instance = pool(); const selected = await instance.getStore("tenant", vdb);
+    expect(match(instance, "tenant", selected.store)).toMatchObject({ generation: 1, constructedBackend: "tcvdb" });
+    const forged = new Proxy({}, { get() { throw new Error("Unexpected Store property access"); } });
+    expect(match(instance, "tenant", forged)).toBeNull();
+    expect(match(instance, "absent", selected.store)).toBeNull();
+  });
+
+  it("distinguishes different Entries and different Pools with the same labels", async () => {
+    const first = pool(), second = pool();
+    const a = await first.getStore("a", vdb), b = await first.getStore("b", vdb);
+    const other = await second.getStore("a", vdb);
+    expect(match(first, "a", a.store)?.generation).toBe(1);
+    expect(match(first, "b", b.store)?.generation).toBe(2);
+    expect(match(first, "a", b.store)).toBeNull();
+    expect(match(first, "a", other.store)).toBeNull();
+  });
+
+  it("invalidates evicted references instead of matching a replacement generation", async () => {
+    const instance = pool(); const old = await instance.getStore("tenant", vdb);
+    const snapshot = match(instance, "tenant", old.store);
+    await instance.evict("tenant"); expect(match(instance, "tenant", old.store)).toBeNull();
+    const current = await instance.getStore("tenant", vdb);
+    expect(match(instance, "tenant", old.store)).toBeNull();
+    expect(match(instance, "tenant", current.store)?.generation).toBe(2);
+    expect(snapshot?.generation).toBe(1);
+  });
+
+  it("rechecks Entry ownership after reading existing initialization diagnostics", async () => {
+    const instance = pool(); const selected = await instance.getStore("tenant", vdb);
+    (selected.store as any).getInitializationObservation.mockImplementation(() => {
+      void instance.evict("tenant");
+      return { attempt: 1, status: "SUCCEEDED" };
+    });
+    expect(match(instance, "tenant", selected.store)).toBeNull();
+  });
+});
+
 interface InitializationObservation {
   readonly attempt: number;
   readonly status: "UNKNOWN" | "SUCCEEDED" | "FAILED";

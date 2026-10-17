@@ -58,7 +58,7 @@ import { validateAndNormalizeRaw, SeedValidationError } from "../core/seed/input
 import { executeSeed } from "../core/seed/seed-runtime.js";
 import type { SeedProgress } from "../core/seed/types.js";
 import { handleV2Route, errorEnvelope, makeRequestId } from "./v2-router.js";
-import type { GatewayAuthState, V2RouterDeps } from "./v2-router.js";
+import type { GatewayAuthState, V2RouterDeps, ProfileScopedStorageObservation } from "./v2-router.js";
 import { handleV3MetaRoute, V3_PREFIX } from "../metadata/router/v3-meta-router.js";
 import { handleInternalMetaRoute, V3_INTERNAL_PREFIX } from "../metadata/router/internal-meta-router.js";
 import { MetadataService } from "../metadata/service/metadata-service.js";
@@ -294,6 +294,26 @@ export interface StateBackendRuntimeObservation {
   readonly selectionStatus: "UNKNOWN" | "ACCEPTED";
 }
 
+/** Point-in-time request identity only; never database health or trusted runtime evidence. */
+export interface ApprovedMemoryStoreObservation {
+  readonly selectionSource: "UNKNOWN" | "STOREPOOL" | "CORE_FALLBACK";
+  readonly poolMatch: "UNKNOWN" | "MATCHED";
+  readonly constructedBackend: "UNKNOWN" | "sqlite" | "tcvdb";
+  readonly generation: number | null;
+  readonly initStatus: "UNKNOWN" | "SUCCEEDED" | "FAILED";
+}
+
+type ApprovedMemoryStoreBinding = {
+  source: "CORE_FALLBACK";
+  store: import("../core/store/types.js").IMemoryStore | undefined;
+} | {
+  source: "STOREPOOL";
+  store: import("../core/store/types.js").IMemoryStore;
+  pool: StorePool;
+  provider: InstanceConfigProvider;
+  instanceId: string;
+};
+
 export class TdaiGateway {
   private config: GatewayConfig;
   private logger: Logger;
@@ -327,6 +347,14 @@ export class TdaiGateway {
   // ── COS: global shared client singleton + per-instance StorageAdapter cache ──
   private sharedCosClient: import("../integrations/cos/cos-backend.js").SharedCosClient | null = null;
   private cosStorageCache: Map<string, StorageAdapter> | null = null;
+  /** Weak request ownership only; never a global last-selected adapter or persistent identity. */
+  private profileStorageRequests = new WeakMap<http.IncomingMessage, {
+    selection?: Readonly<ProfileScopedStorageObservation>;
+  }>();
+  private approvedMemoryStoreRequests = new WeakMap<http.IncomingMessage, {
+    candidate: ApprovedMemoryStoreBinding | undefined;
+    selection: ApprovedMemoryStoreBinding | undefined;
+  }>();
 
   // ── Metadata (v3): shared store pool + per-instance MetadataService ──
   private metadataStorePool: MetadataStorePool | null = null;
@@ -457,6 +485,34 @@ export class TdaiGateway {
       constructedStateBackend: "UNKNOWN",
       selectionStatus: "UNKNOWN",
     });
+  }
+
+  /** Current request only. Returned scalars never prove backend identity, health or tenant ownership. */
+  getProfileStorageObservation(req: http.IncomingMessage): Readonly<ProfileScopedStorageObservation> {
+    return this.profileStorageRequests.get(req)?.selection ?? Object.freeze({
+      configuredStorageTarget: "UNKNOWN", baseAdapterStatus: "UNKNOWN", selectedAdapterKind: "UNKNOWN",
+      backendImplementationIdentity: "UNKNOWN", scopeShape: "UNKNOWN", selectionStatus: "UNKNOWN",
+    });
+  }
+
+  /** Revalidate current Pool ownership on every read; held snapshots are historical scalars. */
+  getApprovedMemoryStoreObservation(req: http.IncomingMessage): Readonly<ApprovedMemoryStoreObservation> {
+    const context = this.approvedMemoryStoreRequests.get(req);
+    const selection = context?.selection;
+    const unknown = (selectionSource: ApprovedMemoryStoreObservation["selectionSource"]): Readonly<ApprovedMemoryStoreObservation> =>
+      Object.freeze({ selectionSource, poolMatch: "UNKNOWN", constructedBackend: "UNKNOWN", generation: null, initStatus: "UNKNOWN" });
+    if (!selection) return unknown("UNKNOWN");
+    if (selection.source === "CORE_FALLBACK") return unknown("CORE_FALLBACK");
+    try {
+      if (this.storePool !== selection.pool || this.configProvider !== selection.provider) return unknown("STOREPOOL");
+      const observation = selection.pool.getMatchingStoreObservation(selection.instanceId, selection.store);
+      if (this.approvedMemoryStoreRequests.get(req) !== context) return unknown("UNKNOWN");
+      if (observation && this.storePool === selection.pool && this.configProvider === selection.provider) {
+        return Object.freeze({ selectionSource: "STOREPOOL", poolMatch: "MATCHED",
+          constructedBackend: observation.constructedBackend, generation: observation.generation, initStatus: observation.initStatus });
+      }
+    } catch { /* Diagnostic failure cannot affect request execution. */ }
+    return unknown(this.approvedMemoryStoreRequests.get(req) === context ? "STOREPOOL" : "UNKNOWN");
   }
 
   /**
@@ -892,6 +948,30 @@ export class TdaiGateway {
       return;
     }
 
+    const profileStorageContext: { selection: Readonly<ProfileScopedStorageObservation> | undefined } | null =
+      method === "POST" && /^\/v[23]\/(?:scenario\/(?:ls|read|write|rm|count)|core\/(?:read|write|count))$/.test(pathname) ? { selection: undefined } : null;
+    const forgetProfileStorage = () => {
+      if (profileStorageContext && this.profileStorageRequests.get(req) === profileStorageContext) this.profileStorageRequests.delete(req);
+    };
+    if (profileStorageContext) {
+      this.profileStorageRequests.set(req, profileStorageContext);
+      res.once("finish", forgetProfileStorage);
+      res.once("close", forgetProfileStorage);
+      req.once("aborted", forgetProfileStorage);
+    }
+    const approvedMemoryStoreContext = method === "POST" && /^\/v[23]\/approved-memory\/(?:get|write|search)$/.test(pathname)
+      ? { candidate: undefined as ApprovedMemoryStoreBinding | undefined, selection: undefined as ApprovedMemoryStoreBinding | undefined } : null;
+    const approvedMemoryStoreActive = () => approvedMemoryStoreContext !== null &&
+      this.approvedMemoryStoreRequests.get(req) === approvedMemoryStoreContext && !req.aborted && !res.destroyed && !res.writableEnded;
+    const forgetApprovedMemoryStore = () => {
+      if (approvedMemoryStoreContext && this.approvedMemoryStoreRequests.get(req) === approvedMemoryStoreContext) this.approvedMemoryStoreRequests.delete(req);
+    };
+    if (approvedMemoryStoreContext) {
+      this.approvedMemoryStoreRequests.set(req, approvedMemoryStoreContext);
+      res.once("finish", forgetApprovedMemoryStore);
+      res.once("close", forgetApprovedMemoryStore);
+      req.once("aborted", forgetApprovedMemoryStore);
+    }
     try {
       let gatewayAuthState: GatewayAuthState = "default_open";
       // ── /v2/instance/destroy — admin endpoint, gated by the v1-style
@@ -957,9 +1037,26 @@ export class TdaiGateway {
       }
 
       const v2Deps: V2RouterDeps = {
-        getStore: () => this.core.getVectorStore(),
+        getStore: () => {
+          const store = this.core.getVectorStore();
+          if (approvedMemoryStoreContext && approvedMemoryStoreActive()) {
+            approvedMemoryStoreContext.candidate = { source: "CORE_FALLBACK", store };
+          }
+          return store;
+        },
+        observeApprovedMemoryStoreSelection: (store) => {
+          if (approvedMemoryStoreContext && approvedMemoryStoreActive() && approvedMemoryStoreContext.candidate?.store === store) {
+            approvedMemoryStoreContext.selection = approvedMemoryStoreContext.candidate;
+          }
+        },
         getEmbedding: () => this.core.getEmbeddingService(),
         getStorage: () => this.core.getStorage(),
+        observeProfileStorageSelection: (selection) => {
+          if (profileStorageContext && this.profileStorageRequests.get(req) === profileStorageContext &&
+              !req.aborted && !res.destroyed && !res.writableEnded) {
+            profileStorageContext.selection = selection;
+          }
+        },
         deployMode: this.config.deployMode,
         // Inject pipeline introspection deps for /v2/pipeline/status (standalone-only).
         // Both can be undefined in legacy standalone (no stateBackend configured) —
@@ -1008,6 +1105,9 @@ export class TdaiGateway {
             ? await configProvider.resolveVdb(instanceId)
             : null;
           const pooled = await storePool.getStore(instanceId, vdbConfig);
+          if (approvedMemoryStoreContext && approvedMemoryStoreActive()) {
+            approvedMemoryStoreContext.candidate = { source: "STOREPOOL", store: pooled.store, pool: storePool, provider: configProvider, instanceId };
+          }
           return { store: pooled.store, embedding: pooled.embedding };
         };
 
@@ -1146,6 +1246,19 @@ export class TdaiGateway {
         trace_id: classified.client.trace_id,
         retryable: classified.client.retryable,
       });
+    } finally {
+      forgetApprovedMemoryStore();
+      if (approvedMemoryStoreContext) {
+        res.removeListener("finish", forgetApprovedMemoryStore);
+        res.removeListener("close", forgetApprovedMemoryStore);
+        req.removeListener("aborted", forgetApprovedMemoryStore);
+      }
+      forgetProfileStorage();
+      if (profileStorageContext) {
+        res.removeListener("finish", forgetProfileStorage);
+        res.removeListener("close", forgetProfileStorage);
+        req.removeListener("aborted", forgetProfileStorage);
+      }
     }
   }
 

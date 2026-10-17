@@ -275,6 +275,14 @@ export class StorePool {
     });
   }
 
+  /** Strict local object identity, rechecked after collecting entry diagnostics. */
+  getMatchingStoreObservation(instanceId: string, store: IMemoryStore): Readonly<StoreRuntimeObservation> | null {
+    const entry = this.pool.get(instanceId);
+    if (!entry || entry.pooledStore.store !== store) return null;
+    const observation = this.getStoreObservation(instanceId);
+    return this.pool.get(instanceId) === entry && entry.pooledStore.store === store ? observation : null;
+  }
+
   /**
    * 移除指定实例的 Store (实例下线时调用)
    */

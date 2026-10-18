@@ -729,6 +729,98 @@ fn standalone_child_does_not_unlock_gateway_or_old_synthetic_fixture_policy() {
         assert_eq!(c.ipc_stage(), 0);
     }
 }
+
+fn assert_original_token_cancelled(cancel: CancelToken) {
+    // A second, valid request sharing the original token must be rejected
+    // before spawn. This checks state identity without exposing token internals.
+    let f = ProcessFixture::new();
+    let mut probe = f.request(SyntheticCase::Wait);
+    probe.cancel = cancel;
+    assert_eq!(
+        windows_runtime_boundary::launch_synthetic(probe)
+            .unwrap_err()
+            .code(),
+        "cancelled_before_spawn"
+    );
+}
+#[test]
+fn engine_adapter_same_control_cancels_standalone_ipc_and_original_token() {
+    let f = ProcessFixture::new();
+    let control = SyntheticProcessControl::new();
+    let request = standalone_chain_request(&f);
+    let original = request.cancel.clone();
+    let stopper = stop_in_ipc_stage(control.clone(), 2, true);
+    let mut sink = ProcessSink::default();
+    let result = run_synthetic_ipc_lifecycle(
+        &mut sink,
+        request,
+        control.clone(),
+        SyntheticIpcCase::ChallengeWait,
+    );
+    stopper.join().unwrap();
+    let report = result.unwrap();
+    let ipc = report.ipc.unwrap();
+    let launch = report.launch.unwrap();
+    assert!(ipc.cancellation_observed && !ipc.authenticated && ipc.pipe_released_before_job);
+    assert!(!launch.startup_confirmed);
+    assert!(launch.process_reaped && launch.job_closed && launch.output_readers_joined);
+    assert!(report.lifecycle.worker_joined && report.lifecycle.resources_released);
+    assert!(!sink.states.iter().any(|s| s.phase == ServicePhase::Running));
+    assert_eq!(sink.stopped_calls, 1);
+    assert_original_token_cancelled(original);
+    control.stop().unwrap();
+    println!("ENGINE_ADAPTER=shared_Control->original_R2_token->R3_peer_cancelled->Pipe_drop->Job_reap->readers_and_Worker_join->STOPPED;SCM:false");
+}
+#[test]
+fn engine_adapter_successful_receipt_survives_stop_without_replacing_the_token() {
+    let f = ProcessFixture::new();
+    let control = SyntheticProcessControl::new();
+    let request = standalone_chain_request(&f);
+    let original = request.cancel.clone();
+    let mut sink = process_sink(&control);
+    let report =
+        run_synthetic_ipc_lifecycle(&mut sink, request, control, SyntheticIpcCase::Authenticate)
+            .unwrap();
+    let ipc = report.ipc.unwrap();
+    let launch = report.launch.unwrap();
+    assert!(ipc.authenticated && ipc.process_identity_matched && !ipc.cancellation_observed);
+    assert!(
+        launch.startup_confirmed
+            && launch.process_reaped
+            && launch.job_closed
+            && launch.output_readers_joined
+    );
+    assert!(report.lifecycle.worker_joined && report.lifecycle.resources_released);
+    assert_eq!(
+        sink.states
+            .iter()
+            .filter(|s| s.phase == ServicePhase::Running)
+            .count(),
+        1
+    );
+    assert_eq!(sink.stopped_calls, 1);
+    assert_original_token_cancelled(original);
+}
+#[test]
+fn engine_adapter_scm_cli_cannot_authorize_a_development_ipc_candidate() {
+    let f = ProcessFixture::new();
+    let request = standalone_chain_request(&f);
+    for switches in [
+        vec![request.executable.as_os_str().to_owned()],
+        vec!["--ipc".into(), request.executable.as_os_str().to_owned()],
+    ] {
+        let mut argv = vec![std::ffi::OsString::from(
+            "cmg-runtime-boundary-test-service.exe",
+        )];
+        argv.extend(switches);
+        // Rejected before even calling the dispatcher; no SCM installation,
+        // status handle, Control registration or process creation is performed.
+        assert_eq!(
+            run_service_host(argv).unwrap_err().code(),
+            "command_line_rejected"
+        );
+    }
+}
 fn run_ipc_chain(
     sink: &mut impl StatusSink,
     request: LaunchRequest,

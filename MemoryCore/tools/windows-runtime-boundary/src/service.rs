@@ -1051,6 +1051,14 @@ fn run_engine_with_process(
     case: Option<SyntheticServiceCase>,
     process: Option<(LaunchRequest, Arc<Mutex<ProcessState>>)>,
 ) -> Result<SyntheticServiceReport, ServiceError> {
+    // The engine owns the Control -> request token binding, irrespective of
+    // which internal entry supplied the service-owned Arc. Bind before START_PENDING
+    // can accept STOP. Duplicate preparation must fail before installing cleanup
+    // for a lifecycle owned by somebody else. R2 still validates the request
+    // before creating anything; this binding grants no launch authorization.
+    if let Some((request, _)) = &process {
+        control.install_process_cancel(request.cancel.clone())?;
+    }
     let _cleanup = EngineCleanup(control.clone());
     let mut machine = ServiceMachine::new();
     let mut worker: Option<Worker> = None;
@@ -1186,9 +1194,6 @@ pub fn run_synthetic_process_lifecycle(
     request: LaunchRequest,
     control: SyntheticProcessControl,
 ) -> Result<SyntheticProcessReport, ServiceError> {
-    control
-        .inner
-        .install_process_cancel(request.cancel.clone())?;
     let state = Arc::new(Mutex::new(ProcessState::default()));
     let lifecycle =
         run_engine_with_process(sink, control.inner, None, Some((request, state.clone())))?;
@@ -1215,9 +1220,6 @@ pub fn run_synthetic_ipc_lifecycle(
     ) {
         return Err(ServiceError::new("ipc_fixture_required"));
     }
-    control
-        .inner
-        .install_process_cancel(request.cancel.clone())?;
     let state = Arc::new(Mutex::new(ProcessState {
         ipc_case: Some(case),
         ipc: Some(SyntheticIpcReport::default()),
@@ -1271,6 +1273,24 @@ fn save_host_error(error: ServiceError) {
         *slot = Some(error);
     }
 }
+// Shared dispatch logic only. Offline tests can exercise the exact same Arc's
+// STOP/SHUTDOWN effects without registering a service or inventing an SCM event.
+fn dispatch_control(state: &Control, control: u32) -> u32 {
+    if !state.active.load(Ordering::SeqCst) {
+        return ERROR_SERVICE_NOT_ACTIVE;
+    }
+    match control {
+        SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => match state.request_stop() {
+            Ok(()) => NO_ERROR,
+            Err(e) => e.native_code.unwrap_or(ERROR_SERVICE_SPECIFIC_ERROR),
+        },
+        SERVICE_CONTROL_INTERROGATE => {
+            state.interrogate.store(true, Ordering::SeqCst);
+            NO_ERROR
+        }
+        _ => ERROR_CALL_NOT_IMPLEMENTED,
+    }
+}
 unsafe extern "system" fn handler(
     control: u32,
     _event: u32,
@@ -1281,20 +1301,7 @@ unsafe extern "system" fn handler(
         let Some(state) = CONTROL.get() else {
             return ERROR_SERVICE_NOT_ACTIVE;
         };
-        if !state.active.load(Ordering::SeqCst) {
-            return ERROR_SERVICE_NOT_ACTIVE;
-        }
-        match control {
-            SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => match state.request_stop() {
-                Ok(()) => NO_ERROR,
-                Err(e) => e.native_code.unwrap_or(ERROR_SERVICE_SPECIFIC_ERROR),
-            },
-            SERVICE_CONTROL_INTERROGATE => {
-                state.interrogate.store(true, Ordering::SeqCst);
-                NO_ERROR
-            }
-            _ => ERROR_CALL_NOT_IMPLEMENTED,
-        }
+        dispatch_control(state, control)
     });
     result.unwrap_or_else(|_| std::process::abort())
 }
@@ -2056,9 +2063,6 @@ mod r4b_tests {
         let fixture = RaceFixture::new();
         let request = fixture.request(SyntheticCase::Wait);
         let control = Arc::new(Control::new());
-        control
-            .install_process_cancel(request.cancel.clone())
-            .unwrap();
         let state = Arc::new(Mutex::new(ProcessState::default()));
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_engine_with_process(
@@ -2106,10 +2110,6 @@ mod r4b_tests {
         let request = fixture.request(SyntheticCase::Wait);
         let control = SyntheticProcessControl::new();
         let state = Arc::new(Mutex::new(ProcessState::default()));
-        control
-            .inner
-            .install_process_cancel(request.cancel.clone())
-            .unwrap();
         let mut sink = ReentrantSink {
             control: control.clone(),
             states: vec![],
@@ -2143,5 +2143,149 @@ mod r4b_tests {
     #[test]
     fn process_sink_stop_reentry_fails_without_deadlock_and_cleans_up() {
         isolated("process_reentrant_stop");
+    }
+
+    #[test]
+    fn engine_adapter_binds_service_owned_control_before_start_pending() {
+        struct BindingSink {
+            control: Arc<Control>,
+            cancel: CancelToken,
+            phases: Vec<ServicePhase>,
+        }
+        impl StatusSink for BindingSink {
+            fn report(&mut self, snapshot: ServiceSnapshot) -> Result<(), ServiceError> {
+                self.phases.push(snapshot.phase);
+                if snapshot.phase == ServicePhase::StartPending {
+                    self.control.request_stop()?;
+                    assert!(
+                        self.cancel.is_cancelled(),
+                        "accepted service-owned STOP did not reach the request's R2 token"
+                    );
+                }
+                Ok(())
+            }
+        }
+        let fixture = RaceFixture::new();
+        let request = fixture.request(SyntheticCase::Wait);
+        let control = Arc::new(Control::new());
+        let state = Arc::new(Mutex::new(ProcessState::default()));
+        let mut sink = BindingSink {
+            control: control.clone(),
+            cancel: request.cancel.clone(),
+            phases: vec![],
+        };
+        // Deliberately use the internal engine with the service-owned Arc, not
+        // the public wrapper's preinstalled token. No SCM is registered here.
+        let report =
+            run_engine_with_process(&mut sink, control, None, Some((request, state.clone())))
+                .unwrap();
+        assert!(report.worker_joined && report.resources_released);
+        assert_eq!(
+            sink.phases,
+            vec![
+                ServicePhase::StartPending,
+                ServicePhase::StopPending,
+                ServicePhase::Stopped
+            ]
+        );
+        assert!(state.lock().unwrap().report.is_none());
+    }
+
+    #[test]
+    fn engine_adapter_handler_stop_and_shutdown_cancel_the_original_r2_token() {
+        struct HandlerSink {
+            control: Arc<Control>,
+            kind: u32,
+            phases: Vec<ServicePhase>,
+            calls: Vec<thread::JoinHandle<u32>>,
+        }
+        impl StatusSink for HandlerSink {
+            fn report(&mut self, s: ServiceSnapshot) -> Result<(), ServiceError> {
+                self.phases.push(s.phase);
+                if s.phase == ServicePhase::Running {
+                    for _ in 0..4 {
+                        let state = self.control.clone();
+                        let kind = self.kind;
+                        // RUNNING publication owns transition. Never join a
+                        // control-delivery thread from inside the status sink.
+                        self.calls
+                            .push(thread::spawn(move || dispatch_control(&state, kind)));
+                    }
+                }
+                Ok(())
+            }
+        }
+        for kind in [SERVICE_CONTROL_STOP, SERVICE_CONTROL_SHUTDOWN] {
+            let fixture = RaceFixture::new();
+            let request = fixture.request(SyntheticCase::Wait);
+            let cancel = request.cancel.clone();
+            let control = Arc::new(Control::new());
+            let state = Arc::new(Mutex::new(ProcessState::default()));
+            let mut sink = HandlerSink {
+                control: control.clone(),
+                kind,
+                phases: vec![],
+                calls: vec![],
+            };
+            let report = run_engine_with_process(
+                &mut sink,
+                control.clone(),
+                None,
+                Some((request, state.clone())),
+            )
+            .unwrap();
+            for call in sink.calls {
+                assert!(matches!(
+                    call.join().unwrap(),
+                    NO_ERROR | ERROR_SERVICE_NOT_ACTIVE
+                ));
+            }
+            assert!(cancel.is_cancelled());
+            assert!(report.worker_joined && report.resources_released);
+            assert_eq!(
+                sink.phases,
+                vec![
+                    ServicePhase::StartPending,
+                    ServicePhase::Running,
+                    ServicePhase::StopPending,
+                    ServicePhase::Stopped
+                ]
+            );
+            let launch = state.lock().unwrap().report.take().unwrap();
+            assert_eq!(launch.outcome, LaunchOutcome::Aborted);
+            assert!(launch.job_closed && launch.process_reaped && launch.output_readers_joined);
+            assert_eq!(dispatch_control(&control, kind), ERROR_SERVICE_NOT_ACTIVE);
+        }
+    }
+
+    #[test]
+    fn engine_adapter_duplicate_preparation_does_not_cancel_or_clear_the_owner() {
+        let fixture = RaceFixture::new();
+        let request = fixture.request(SyntheticCase::Wait);
+        let attempted = request.cancel.clone();
+        let owner = CancelToken::new();
+        let control = Arc::new(Control::new());
+        control.install_process_cancel(owner.clone()).unwrap();
+        let state = Arc::new(Mutex::new(ProcessState::default()));
+        let trace = Trace::default();
+        let mut sink = sink(&trace);
+        let error = run_engine_with_process(
+            &mut sink,
+            control.clone(),
+            None,
+            Some((request, state.clone())),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "duplicate_service_preparation");
+        assert!(control.active.load(Ordering::SeqCst));
+        assert!(!owner.is_cancelled() && !attempted.is_cancelled());
+        assert!(control.event.lock().unwrap().is_none() && state.lock().unwrap().report.is_none());
+        assert!(trace.states.lock().unwrap().is_empty());
+        assert_eq!(
+            dispatch_control(&control, SERVICE_CONTROL_SHUTDOWN),
+            NO_ERROR
+        );
+        assert!(owner.is_cancelled() && !attempted.is_cancelled());
+        control.clear();
     }
 }

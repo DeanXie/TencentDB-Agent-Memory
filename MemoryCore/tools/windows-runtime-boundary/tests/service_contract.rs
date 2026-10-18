@@ -365,3 +365,302 @@ fn r4b_failed_running_report_cannot_be_retried_as_success() {
     machine.finish_stop(&mut sink, true).unwrap();
     assert_ne!(sink.states.last().unwrap().service_exit_code, 0);
 }
+
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
+use windows_runtime_boundary::{
+    CancelToken, LaunchRequest, LaunchTarget, SyntheticCase, NODE_TEST_TOOL, SYNTHETIC_ENTRY,
+    SYNTHETIC_ENTRY_SOURCE, SYNTHETIC_PACKAGE,
+};
+static NEXT: AtomicU64 = AtomicU64::new(0);
+fn hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+struct ProcessFixture {
+    root: PathBuf,
+    manifest: Value,
+}
+impl ProcessFixture {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "service-process-fixture-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let graph=serde_json::to_vec(&json!({"format":"gateway-js-dependency-staging/v1","edges":[{"status":"UNRESOLVED"}],"TRANSITIVE_CLOSURE_PROVEN":false,"NATIVE_LOAD_VERIFIED":false,"DEVELOPMENT_PATH_ESCAPE":false})).unwrap();
+        let node = json!({"version":"v24.16.0","platform":"win32","architecture":"x64","moduleABI":"137","napi":"10","runtimeCompatibility":"NOT_LOAD_VERIFIED"});
+        let build = json!({"name":"esbuild","version":"0.28.2","typescriptVersion":"6.0.3","lockVersionMatched":true,"lockSha256":"1".repeat(64),"jsEntrypoints":[{"path":"node_modules/esbuild/lib/main.js","bytes":1,"sha256":"2".repeat(64)}],"executableIdentity":{"bytes":1,"sha256":"3".repeat(64)},"transformCalls":1});
+        let report=serde_json::to_vec(&json!({"format":"gateway-js-candidate-closure/v1","entryOutput":SYNTHETIC_ENTRY,"CANDIDATE_BUILD_SUCCESS":true,"buildExitCode":0,"buildTool":build,"node":node,"jsDependencyStaging":{"graphPath":"js-dependency-graph.json","graphSha256":hash(&graph),"unresolvedEdges":1,"TRANSITIVE_CLOSURE_PROVEN":false,"NATIVE_LOAD_VERIFIED":false,"DEVELOPMENT_PATH_ESCAPE":false},"closureGateExitCode":2,"RELEASE_ELIGIBLE":false,"RELEASE_DEPENDENCY_CLOSURE_COMPLETE":false})).unwrap();
+        let files = [
+            ("app/package.json", SYNTHETIC_PACKAGE.as_bytes(), "metadata"),
+            (
+                SYNTHETIC_ENTRY,
+                SYNTHETIC_ENTRY_SOURCE.as_bytes(),
+                "gateway-js",
+            ),
+            ("closure-report.json", report.as_slice(), "report"),
+            ("js-dependency-graph.json", graph.as_slice(), "report"),
+        ]
+        .into_iter()
+        .map(|(p, b, k)| {
+            let f = root.join(p);
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, b).unwrap();
+            json!({"path":p,"size":b.len(),"sha256":hash(b),"kind":k})
+        })
+        .collect::<Vec<_>>();
+        for name in ["temp", "work"] {
+            fs::create_dir(root.join(name)).unwrap();
+        }
+        let manifest = json!({"format_version":2,"platform":"windows","architecture":"x86_64","validation_scope":"candidate-static-tree","production_eligible":false,"entry":SYNTHETIC_ENTRY,"node":node,"node_identity_scope":"reported-target-not-packaged","build_tool":build,"closure":{"path":"closure-report.json","sha256":hash(&report),"graph_path":"js-dependency-graph.json","graph_sha256":hash(&graph),"unresolved_edges":1},"runtime":{"dependency_closure_proven":false,"native_load_verified":false,"config_isolation":false,"protected_service":false,"trusted_issuer":false},"directories":["app","app/src","app/src/gateway","temp","work"],"files":files});
+        Self { root, manifest }
+    }
+    fn request(&self, case: SyntheticCase) -> LaunchRequest {
+        LaunchRequest {
+            target: LaunchTarget::Synthetic(case),
+            release_root: self.root.clone(),
+            manifest: serde_json::to_vec(&self.manifest).unwrap(),
+            executable: PathBuf::from(NODE_TEST_TOOL),
+            entry: SYNTHETIC_ENTRY.into(),
+            arguments: vec![],
+            working_directory: self.root.join("work"),
+            environment_overrides: vec![],
+            timeout: Duration::from_secs(2),
+            cancel: CancelToken::new(),
+        }
+    }
+}
+impl Drop for ProcessFixture {
+    fn drop(&mut self) {
+        assert!(self.root.starts_with(std::env::temp_dir()));
+        fs::remove_dir_all(&self.root).unwrap();
+    }
+}
+
+#[derive(Default)]
+struct ProcessSink {
+    states: Vec<ServiceSnapshot>,
+    control: Option<SyntheticProcessControl>,
+    stop_at: Option<ServicePhase>,
+    fail_at: Option<ServicePhase>,
+    duplicate_stop: bool,
+    stopped_calls: usize,
+    stoppers: Vec<thread::JoinHandle<()>>,
+}
+impl StatusSink for ProcessSink {
+    fn report(&mut self, snapshot: ServiceSnapshot) -> Result<(), ServiceError> {
+        if snapshot.phase == ServicePhase::Stopped {
+            self.stopped_calls += 1;
+        }
+        if self.fail_at == Some(snapshot.phase) {
+            return Err(ServiceError::test_status_fault());
+        }
+        self.states.push(snapshot);
+        if self.stop_at == Some(snapshot.phase) {
+            let control = self.control.as_ref().unwrap().clone();
+            // RUNNING publication owns the transition lock; emulate asynchronous
+            // control delivery rather than recursively requesting STOP in the sink.
+            if snapshot.phase == ServicePhase::Running {
+                let twice = self.duplicate_stop;
+                self.stoppers.push(thread::spawn(move || {
+                    control.stop().unwrap();
+                    if twice {
+                        control.stop().unwrap();
+                    }
+                }));
+            } else {
+                control.stop().unwrap();
+            }
+        }
+        Ok(())
+    }
+}
+impl Drop for ProcessSink {
+    fn drop(&mut self) {
+        for thread in self.stoppers.drain(..) {
+            thread.join().unwrap();
+        }
+    }
+}
+fn process_sink(control: &SyntheticProcessControl) -> ProcessSink {
+    let mut sink = ProcessSink::default();
+    sink.control = Some(control.clone());
+    sink.stop_at = Some(ServicePhase::Running);
+    sink
+}
+#[test]
+fn process_worker_valid_ack_then_stop_reaps_and_joins_readers() {
+    let f = ProcessFixture::new();
+    let control = SyntheticProcessControl::new();
+    let mut sink = process_sink(&control);
+    let result = run_synthetic_process_lifecycle(
+        &mut sink,
+        f.request(windows_runtime_boundary::SyntheticCase::Wait),
+        control,
+    )
+    .unwrap();
+    let launch = result.launch.unwrap();
+    assert!(launch.startup_confirmed && launch.output_readers_joined);
+    assert!(launch.process_reaped && launch.job_closed);
+    assert_eq!(
+        launch.outcome,
+        windows_runtime_boundary::LaunchOutcome::Aborted
+    );
+    assert!(result.lifecycle.worker_joined && result.lifecycle.resources_released);
+    assert!(result.lifecycle.prepared_before_running);
+    assert_eq!(
+        sink.states.iter().map(|s| s.phase).collect::<Vec<_>>(),
+        vec![
+            ServicePhase::StartPending,
+            ServicePhase::Running,
+            ServicePhase::StopPending,
+            ServicePhase::Stopped
+        ]
+    );
+    assert_eq!(sink.stopped_calls, 1);
+}
+#[test]
+fn process_worker_stop_before_spawn_suppresses_running() {
+    let f = ProcessFixture::new();
+    let control = SyntheticProcessControl::new();
+    control.stop().unwrap();
+    let mut sink = process_sink(&control);
+    let result = run_synthetic_process_lifecycle(
+        &mut sink,
+        f.request(windows_runtime_boundary::SyntheticCase::Wait),
+        control,
+    )
+    .unwrap();
+    assert!(result.launch.is_none());
+    assert!(!sink.states.iter().any(|s| s.phase == ServicePhase::Running));
+    assert!(result.lifecycle.worker_joined && result.lifecycle.resources_released);
+    assert_eq!(sink.stopped_calls, 1);
+}
+#[test]
+fn process_worker_stop_at_start_pending_is_not_lost() {
+    let f = ProcessFixture::new();
+    let control = SyntheticProcessControl::new();
+    let mut sink = process_sink(&control);
+    sink.stop_at = Some(ServicePhase::StartPending);
+    let result = run_synthetic_process_lifecycle(
+        &mut sink,
+        f.request(windows_runtime_boundary::SyntheticCase::Wait),
+        control,
+    )
+    .unwrap();
+    assert!(!sink.states.iter().any(|s| s.phase == ServicePhase::Running));
+    assert!(result.lifecycle.worker_joined && result.lifecycle.resources_released);
+    assert_eq!(sink.stopped_calls, 1);
+}
+#[test]
+fn process_worker_repeated_stop_reports_terminal_once() {
+    let f = ProcessFixture::new();
+    let control = SyntheticProcessControl::new();
+    let mut sink = process_sink(&control);
+    sink.duplicate_stop = true;
+    let result = run_synthetic_process_lifecycle(
+        &mut sink,
+        f.request(windows_runtime_boundary::SyntheticCase::Wait),
+        control,
+    )
+    .unwrap();
+    assert!(result.lifecycle.worker_joined && result.lifecycle.resources_released);
+    assert_eq!(sink.stopped_calls, 1);
+    assert_eq!(
+        sink.states
+            .iter()
+            .filter(|s| s.phase == ServicePhase::Running)
+            .count(),
+        1
+    );
+}
+#[test]
+fn process_worker_rejects_bad_manifest_without_running() {
+    let f = ProcessFixture::new();
+    let mut request = f.request(windows_runtime_boundary::SyntheticCase::Wait);
+    request.manifest = b"{}".to_vec();
+    let control = SyntheticProcessControl::new();
+    let mut sink = process_sink(&control);
+    assert!(run_synthetic_process_lifecycle(&mut sink, request, control).is_err());
+    assert!(!sink.states.iter().any(|s| s.phase == ServicePhase::Running));
+    assert_eq!(sink.stopped_calls, 1);
+}
+#[test]
+fn process_worker_timeout_is_a_failure_with_terminal_cleanup() {
+    let f = ProcessFixture::new();
+    let mut request = f.request(windows_runtime_boundary::SyntheticCase::Wait);
+    request.timeout = Duration::from_millis(700);
+    let control = SyntheticProcessControl::new();
+    let mut sink = process_sink(&control);
+    sink.stop_at = None;
+    let error = run_synthetic_process_lifecycle(&mut sink, request, control).unwrap_err();
+    assert_eq!(error.code(), "synthetic_process_timeout");
+    assert_eq!(sink.stopped_calls, 1);
+    assert_eq!(sink.states.last().unwrap().phase, ServicePhase::Stopped);
+    assert_ne!(sink.states.last().unwrap().service_exit_code, 0);
+}
+#[test]
+fn process_worker_status_failures_preserve_original_error_and_stop_once() {
+    for phase in [
+        ServicePhase::StartPending,
+        ServicePhase::Running,
+        ServicePhase::StopPending,
+        ServicePhase::Stopped,
+    ] {
+        let f = ProcessFixture::new();
+        let control = SyntheticProcessControl::new();
+        let mut sink = process_sink(&control);
+        sink.fail_at = Some(phase);
+        let error = run_synthetic_process_lifecycle(
+            &mut sink,
+            f.request(windows_runtime_boundary::SyntheticCase::Wait),
+            control,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "synthetic_status_failure");
+        assert!(!sink.states.iter().any(|s| s.phase == phase));
+        assert!(sink.stopped_calls <= 1);
+    }
+}
+#[test]
+fn process_worker_early_exit_cannot_report_success() {
+    for case in [
+        windows_runtime_boundary::SyntheticCase::Normal,
+        windows_runtime_boundary::SyntheticCase::Nonzero,
+    ] {
+        let f = ProcessFixture::new();
+        let control = SyntheticProcessControl::new();
+        let mut sink = process_sink(&control);
+        sink.stop_at = None;
+        assert!(run_synthetic_process_lifecycle(&mut sink, f.request(case), control).is_err());
+        assert_eq!(sink.stopped_calls, 1);
+        assert_ne!(sink.states.last().unwrap().service_exit_code, 0);
+    }
+}
+#[test]
+fn process_worker_failed_instance_does_not_poison_next_request() {
+    let f = ProcessFixture::new();
+    let mut bad = f.request(windows_runtime_boundary::SyntheticCase::Wait);
+    bad.manifest.clear();
+    assert!(run_synthetic_process_lifecycle(
+        &mut ProcessSink::default(),
+        bad,
+        SyntheticProcessControl::new()
+    )
+    .is_err());
+    let control = SyntheticProcessControl::new();
+    let mut sink = process_sink(&control);
+    let good = run_synthetic_process_lifecycle(
+        &mut sink,
+        f.request(windows_runtime_boundary::SyntheticCase::Wait),
+        control,
+    )
+    .unwrap();
+    assert!(good.lifecycle.worker_joined && good.launch.unwrap().output_readers_joined);
+}

@@ -82,6 +82,8 @@ pub enum LaunchEvent {
 }
 #[derive(Debug)]
 pub struct LaunchReport {
+    pub startup_confirmed: bool,
+    pub output_readers_joined: bool,
     pub job_binding_at_creation: bool,
     pub job_membership_verified: bool,
     pub pre_execution_limits_verified: bool,
@@ -139,11 +141,59 @@ impl std::fmt::Display for LaunchError {
     }
 }
 impl std::error::Error for LaunchError {}
-fn error(code: &'static str) -> LaunchError {
+pub(crate) fn error(code: &'static str) -> LaunchError {
     LaunchError {
         code,
         os_error: None,
     }
+}
+/// A duplicate of the original child process object, never a PID lookup.
+/// Liveness is a point-in-time observation, not a loaded-code trust claim.
+#[derive(Debug)]
+pub(crate) struct StartedChild {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    process: std::os::windows::io::OwnedHandle,
+}
+impl StartedChild {
+    pub(crate) fn is_alive(&self) -> Result<bool, LaunchError> {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::{Foundation::*, System::Threading::*};
+            match unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) } {
+                WAIT_TIMEOUT => Ok(true),
+                WAIT_OBJECT_0 => Ok(false),
+                _ => Err(LaunchError {
+                    code: "startup_probe_failed",
+                    os_error: std::io::Error::last_os_error().raw_os_error(),
+                }),
+            }
+        }
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        Err(error("platform_unavailable"))
+    }
+}
+pub(crate) fn launch_with_startup(
+    request: LaunchRequest,
+    on_ready: &mut dyn FnMut(StartedChild) -> Result<(), LaunchError>,
+) -> Result<LaunchReport, LaunchError> {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        windows::launch_controlled(request, on_ready)
+    }
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    {
+        let _ = (request, on_ready);
+        Err(error("platform_unavailable"))
+    }
+}
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+pub(crate) fn launch_with_startup_observed(
+    request: LaunchRequest,
+    on_ready: &mut dyn FnMut(StartedChild) -> Result<(), LaunchError>,
+    observer: &mut dyn FnMut(&LaunchObservation),
+) -> Result<LaunchReport, LaunchError> {
+    windows::launch_core(request, Some(observer), Some(on_ready))
 }
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows {
@@ -160,11 +210,12 @@ mod windows {
         io::{Read, Write},
         os::windows::{
             ffi::OsStrExt,
-            io::{AsRawHandle, FromRawHandle},
+            io::{AsHandle, AsRawHandle, FromRawHandle},
             process::{CommandExt, ExitStatusExt},
         },
         path::Path,
         process::{Command, ExitStatus, Stdio},
+        sync::mpsc::{self, Receiver, RecvTimeoutError},
         thread,
         time::Instant,
     };
@@ -752,6 +803,227 @@ mod windows {
         }
         String::from_utf8(bytes).map_err(|_| error("output_invalid"))
     }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StartupAck {
+        scenario: String,
+        cwd: String,
+        #[serde(rename = "execArgv")]
+        exec_argv: Vec<String>,
+        #[serde(deserialize_with = "startup_environment")]
+        environment: std::collections::BTreeMap<String, String>,
+    }
+    fn startup_environment<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<std::collections::BTreeMap<String, String>, D::Error> {
+        struct Environment;
+        impl<'de> serde::de::Visitor<'de> for Environment {
+            type Value = std::collections::BTreeMap<String, String>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a unique environment object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut result = Self::Value::new();
+                while let Some((key, value)) = map.next_entry::<String, String>()? {
+                    if result.insert(key.to_ascii_uppercase(), value).is_some() {
+                        return Err(serde::de::Error::custom("duplicate environment key"));
+                    }
+                }
+                Ok(result)
+            }
+        }
+        deserializer.deserialize_map(Environment)
+    }
+    fn validate_startup(line: &[u8], root: &Path, case: SyntheticCase) -> Result<(), LaunchError> {
+        if line.len() as u64 > MAX_OUTPUT || line.last() != Some(&b'\n') {
+            return Err(error("startup_invalid"));
+        }
+        let ack: StartupAck = serde_json::from_slice(line).map_err(|_| error("startup_invalid"))?;
+        let scenario = match case {
+            SyntheticCase::Normal => "normal",
+            SyntheticCase::Nonzero => "nonzero",
+            SyntheticCase::Wait => "wait",
+        };
+        let expected = [
+            ("SYSTEMROOT", "C:\\Windows".to_owned()),
+            ("WINDIR", "C:\\Windows".to_owned()),
+            ("SYSTEMDRIVE", "C:".to_owned()),
+            ("TEMP", root.join("temp").to_string_lossy().into_owned()),
+            ("TMP", root.join("temp").to_string_lossy().into_owned()),
+            ("R2_SCENARIO", scenario.to_owned()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect::<std::collections::BTreeMap<_, _>>();
+        if ack.scenario != scenario
+            || ack.cwd != root.join("work").to_string_lossy()
+            || ack.exec_argv != ["--no-addons", "--no-global-search-paths"]
+            || ack.environment != expected
+        {
+            return Err(error("startup_invalid"));
+        }
+        Ok(())
+    }
+    type Reader = thread::JoinHandle<Result<String, LaunchError>>;
+    /// Owns every reader together with the only process that can keep its pipe open.
+    /// Drop always kills/reaps/closes the Job before joining, including unwinding.
+    struct Supervised {
+        running: Running,
+        stdout: Option<Reader>,
+        stderr: Option<Reader>,
+        startup: Receiver<Result<Vec<u8>, LaunchError>>,
+    }
+    impl Supervised {
+        fn new(running: Running) -> Result<Self, LaunchError> {
+            let (sender, startup) = mpsc::channel();
+            let mut value = Self {
+                running,
+                stdout: None,
+                stderr: None,
+                startup,
+            };
+            let mut stdout = value
+                .running
+                .child
+                .stdout
+                .take()
+                .ok_or_else(|| error("output_unavailable"))?;
+            value.stdout = Some(
+                thread::Builder::new()
+                    .name("r2-stdout".into())
+                    .spawn(move || {
+                        let mut bytes = Vec::new();
+                        let first = loop {
+                            let mut byte = [0u8];
+                            match stdout.read(&mut byte) {
+                                Ok(0) => break Err(error("startup_eof")),
+                                Ok(_) => {
+                                    bytes.push(byte[0]);
+                                    if bytes.len() as u64 > MAX_OUTPUT {
+                                        break Err(error("output_resource_limit"));
+                                    }
+                                    if byte[0] == b'\n' {
+                                        break Ok(bytes.clone());
+                                    }
+                                }
+                                Err(_) => break Err(error("output_read_failed")),
+                            }
+                        };
+                        let valid_line = first.is_ok();
+                        let _ = sender.send(first);
+                        if !valid_line {
+                            return String::from_utf8(bytes).map_err(|_| error("output_invalid"));
+                        }
+                        stdout
+                            .take(MAX_OUTPUT + 1 - bytes.len() as u64)
+                            .read_to_end(&mut bytes)
+                            .map_err(|_| error("output_read_failed"))?;
+                        if bytes.len() as u64 > MAX_OUTPUT {
+                            return Err(error("output_resource_limit"));
+                        }
+                        String::from_utf8(bytes).map_err(|_| error("output_invalid"))
+                    })
+                    .map_err(|_| error("output_reader_start_failed"))?,
+            );
+            let stderr = value
+                .running
+                .child
+                .stderr
+                .take()
+                .ok_or_else(|| error("output_unavailable"))?;
+            value.stderr = Some(
+                thread::Builder::new()
+                    .name("r2-stderr".into())
+                    .spawn(move || output(Some(stderr)))
+                    .map_err(|_| error("output_reader_start_failed"))?,
+            );
+            Ok(value)
+        }
+        fn cleanup(&mut self) {
+            let _ = self.running.job.close();
+            if !self.running.reaped {
+                let _ = self.running.child.kill();
+                if self.running.child.wait().is_ok() {
+                    self.running.reaped = true;
+                }
+            }
+            self.running.child.stdin.take();
+        }
+        fn join(&mut self) -> Result<(String, String), LaunchError> {
+            // Join both even if the first one failed. Never drop a live JoinHandle.
+            let stdout = self.stdout.take().map(|reader| reader.join());
+            let stderr = self.stderr.take().map(|reader| reader.join());
+            let extract = |joined: Option<std::thread::Result<Result<String, LaunchError>>>| {
+                joined
+                    .ok_or_else(|| error("output_unavailable"))?
+                    .map_err(|_| error("output_reader_panicked"))?
+            };
+            Ok((extract(stdout)?, extract(stderr)?))
+        }
+    }
+    impl Drop for Supervised {
+        fn drop(&mut self) {
+            self.cleanup();
+            if let Some(reader) = self.stdout.take() {
+                let _ = reader.join();
+            }
+            if let Some(reader) = self.stderr.take() {
+                let _ = reader.join();
+            }
+        }
+    }
+    fn await_startup(
+        supervised: &mut Supervised,
+        request: &LaunchRequest,
+        case: SyntheticCase,
+        start: Instant,
+        controlled: bool,
+    ) -> Result<Option<LaunchOutcome>, LaunchError> {
+        loop {
+            let cancelled = request.cancel.0.load(Ordering::SeqCst);
+            let expired = start.elapsed() >= request.timeout;
+            if cancelled || expired {
+                if controlled {
+                    return Err(error(if cancelled {
+                        "startup_cancelled"
+                    } else {
+                        "startup_timeout"
+                    }));
+                }
+                supervised.running.stop()?;
+                return Ok(Some(if cancelled {
+                    LaunchOutcome::Aborted
+                } else {
+                    LaunchOutcome::TimedOut
+                }));
+            }
+            match supervised.startup.recv_timeout(Duration::from_millis(5)) {
+                Ok(line) => {
+                    if request.cancel.0.load(Ordering::SeqCst) || start.elapsed() >= request.timeout
+                    {
+                        continue;
+                    }
+                    validate_startup(&line?, &request.release_root, case)?;
+                    return Ok(None);
+                }
+                Err(RecvTimeoutError::Disconnected) => return Err(error("startup_eof")),
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            if controlled
+                && supervised
+                    .running
+                    .child
+                    .try_wait()
+                    .map_err(|_| error("wait_failed"))?
+                    .is_some()
+            {
+                return Err(error("startup_child_exited"));
+            }
+        }
+    }
     fn tool_hash() -> Result<String, LaunchError> {
         let file = fs::File::open(NODE_TEST_TOOL).map_err(|_| error("test_tool_unavailable"))?;
         let mut reader = file.take(256 * 1024 * 1024 + 1);
@@ -834,7 +1106,20 @@ mod windows {
     }
     pub(super) fn launch_inner(
         request: LaunchRequest,
+        observer: Option<&mut dyn FnMut(&LaunchObservation)>,
+    ) -> Result<LaunchReport, LaunchError> {
+        launch_core(request, observer, None)
+    }
+    pub(super) fn launch_controlled(
+        request: LaunchRequest,
+        on_ready: &mut dyn FnMut(StartedChild) -> Result<(), LaunchError>,
+    ) -> Result<LaunchReport, LaunchError> {
+        launch_core(request, None, Some(on_ready))
+    }
+    pub(super) fn launch_core(
+        request: LaunchRequest,
         mut observer: Option<&mut dyn FnMut(&LaunchObservation)>,
+        mut on_ready: Option<&mut dyn FnMut(StartedChild) -> Result<(), LaunchError>>,
     ) -> Result<LaunchReport, LaunchError> {
         let case = validate(&request)?;
         let test_tool_sha256 = tool_hash()?;
@@ -844,12 +1129,24 @@ mod windows {
             callback(&running.child.observation()?);
         }
         running.resume()?;
+        let mut supervised = Supervised::new(running)?;
         let mut events = vec![LaunchEvent::Created, LaunchEvent::JobAssigned];
+        let mut startup_confirmed = false;
         // Expired/cancelled setup never grants the payload its GO handshake. This is a
         // deadline decision, not an atomic scheduling guarantee against OS preemption.
-        let outcome = if let Some(outcome) =
-            stop_before_go(&mut running, &request.cancel, request.timeout, start)?
-        {
+        let outcome = if let Some(outcome) = stop_before_go(
+            &mut supervised.running,
+            &request.cancel,
+            request.timeout,
+            start,
+        )? {
+            if on_ready.is_some() {
+                return Err(error(if outcome == LaunchOutcome::Aborted {
+                    "startup_cancelled"
+                } else {
+                    "startup_timeout"
+                }));
+            }
             events.push(if outcome == LaunchOutcome::Aborted {
                 LaunchEvent::Aborted
             } else {
@@ -857,7 +1154,8 @@ mod windows {
             });
             outcome
         } else {
-            running
+            supervised
+                .running
                 .child
                 .stdin
                 .take()
@@ -865,16 +1163,64 @@ mod windows {
                 .write_all(b"R2_GO\n")
                 .map_err(|_| error("handshake_failed"))?;
             events.push(LaunchEvent::HandshakeSent);
-            wait_outcome(
-                &mut running,
-                &request.cancel,
-                request.timeout,
-                start,
-                &mut events,
-            )?
+            if let Some(outcome) =
+                await_startup(&mut supervised, &request, case, start, on_ready.is_some())?
+            {
+                events.push(if outcome == LaunchOutcome::Aborted {
+                    LaunchEvent::Aborted
+                } else {
+                    LaunchEvent::TimedOut
+                });
+                outcome
+            } else {
+                startup_confirmed = true;
+                if let Some(callback) = on_ready.as_mut() {
+                    let proof = StartedChild {
+                        process: supervised
+                            .running
+                            .child
+                            .as_handle()
+                            .try_clone_to_owned()
+                            .map_err(|_| native("startup_probe_failed"))?,
+                    };
+                    if !proof.is_alive()? {
+                        return Err(error("startup_child_exited"));
+                    }
+                    if request.cancel.0.load(Ordering::SeqCst) {
+                        return Err(error("startup_cancelled"));
+                    }
+                    if start.elapsed() >= request.timeout {
+                        return Err(error("startup_timeout"));
+                    }
+                    callback(proof)?;
+                    // ACK has been accepted. A subsequent cancellation belongs to
+                    // the running lifecycle and must retain its cleanup report.
+                    // Cancellation before ACK still fails in await_startup above.
+                    if supervised
+                        .running
+                        .child
+                        .try_wait()
+                        .map_err(|_| native("wait_failed"))?
+                        .is_some()
+                    {
+                        return Err(error("startup_child_exited"));
+                    }
+                }
+                wait_outcome(
+                    &mut supervised.running,
+                    &request.cancel,
+                    request.timeout,
+                    start,
+                    &mut events,
+                )?
+            }
         };
-        running.job.close()?; // Close/kills any contained handles BEFORE reading pipes.
+        supervised.running.job.close()?;
+        supervised.cleanup();
+        let (stdout, stderr) = supervised.join()?;
         Ok(LaunchReport {
+            startup_confirmed,
+            output_readers_joined: true,
             job_binding_at_creation: true,
             job_membership_verified: true,
             pre_execution_limits_verified: true,
@@ -882,11 +1228,11 @@ mod windows {
             kill_on_job_close_verified: true,
             outcome,
             events,
-            stdout: output(running.child.stdout.take())?,
-            stderr: output(running.child.stderr.take())?,
+            stdout,
+            stderr,
             elapsed: start.elapsed(),
-            process_reaped: running.reaped,
-            job_closed: running.job.0.is_null(),
+            process_reaped: supervised.running.reaped,
+            job_closed: supervised.running.job.0.is_null(),
             test_tool_sha256,
             synthetic_entry_sha256: format!("{:x}", Sha256::digest(SYNTHETIC_ENTRY_SOURCE)),
         })
@@ -934,6 +1280,157 @@ mod windows {
                 assert!(self.0.is_absolute() && self.0.starts_with(std::env::temp_dir()));
                 fs::remove_dir_all(&self.0).unwrap();
             }
+        }
+        fn startup_request(f: &CoreFixture) -> LaunchRequest {
+            LaunchRequest {
+                target: LaunchTarget::Synthetic(SyntheticCase::Wait),
+                release_root: f.0.clone(),
+                manifest: vec![],
+                executable: PathBuf::from(NODE_TEST_TOOL),
+                entry: SYNTHETIC_ENTRY.into(),
+                arguments: vec![],
+                working_directory: f.0.join("work"),
+                environment_overrides: vec![],
+                timeout: Duration::from_millis(100),
+                cancel: CancelToken::new(),
+            }
+        }
+        #[test]
+        fn startup_ack_rejects_missing_or_changed_process_facts() {
+            let f = CoreFixture::new();
+            let valid = serde_json::json!({
+                "scenario":"wait", "cwd":f.0.join("work"),
+                "execArgv":["--no-addons", "--no-global-search-paths"],
+                "environment":{"SystemRoot":"C:\\Windows", "WINDIR":"C:\\Windows", "SYSTEMDRIVE":"C:",
+                    "TEMP":f.0.join("temp"), "TMP":f.0.join("temp"), "R2_SCENARIO":"wait"}
+            });
+            let encode = |value: &Value| {
+                let mut b = serde_json::to_vec(value).unwrap();
+                b.push(b'\n');
+                b
+            };
+            validate_startup(&encode(&valid), &f.0, SyntheticCase::Wait).unwrap();
+            let mut invalid = vec![serde_json::json!({})];
+            for key in ["scenario", "cwd", "execArgv", "environment"] {
+                let mut changed = valid.clone();
+                changed.as_object_mut().unwrap().remove(key);
+                invalid.push(changed);
+            }
+            for (key, value) in [
+                ("scenario", serde_json::json!("normal")),
+                ("cwd", serde_json::json!("C:\\wrong")),
+                ("execArgv", serde_json::json!(["--inspect"])),
+            ] {
+                let mut changed = valid.clone();
+                changed[key] = value;
+                invalid.push(changed);
+            }
+            let mut extra = valid.clone();
+            extra["environment"]["NODE_OPTIONS"] = serde_json::json!("--inspect");
+            invalid.push(extra);
+            let mut changed = valid.clone();
+            changed["environment"]["TEMP"] = serde_json::json!("C:\\wrong");
+            invalid.push(changed);
+            let mut extra = valid.clone();
+            extra["unexpected"] = serde_json::json!(true);
+            invalid.push(extra);
+            for value in invalid {
+                assert_eq!(
+                    validate_startup(&encode(&value), &f.0, SyntheticCase::Wait)
+                        .unwrap_err()
+                        .code(),
+                    "startup_invalid"
+                );
+            }
+            for invalid in [b"\n".as_slice(), b"not json\n", b"{}", b"{}\n{}\n"] {
+                assert_eq!(
+                    validate_startup(invalid, &f.0, SyntheticCase::Wait)
+                        .unwrap_err()
+                        .code(),
+                    "startup_invalid"
+                );
+            }
+            let duplicated = String::from_utf8(encode(&valid)).unwrap().replace(
+                "\"SystemRoot\":",
+                "\"SYSTEMROOT\":\"C:\\\\Windows\",\"SystemRoot\":",
+            );
+            assert_eq!(
+                validate_startup(duplicated.as_bytes(), &f.0, SyntheticCase::Wait)
+                    .unwrap_err()
+                    .code(),
+                "startup_invalid"
+            );
+        }
+        #[test]
+        fn startup_without_go_times_out_and_eof_is_rejected_with_joined_readers() {
+            let f = CoreFixture::new();
+            for close_stdin in [false, true] {
+                let mut request = startup_request(&f);
+                if close_stdin {
+                    request.timeout = Duration::from_secs(2);
+                }
+                let running = Running::start(command(&f.0, SyntheticCase::Wait)).unwrap();
+                let mut supervised = Supervised::new(running).unwrap();
+                if close_stdin {
+                    supervised.running.child.stdin.take();
+                }
+                let result = await_startup(
+                    &mut supervised,
+                    &request,
+                    SyntheticCase::Wait,
+                    Instant::now(),
+                    true,
+                )
+                .unwrap_err();
+                assert!(if close_stdin {
+                    ["startup_eof", "startup_child_exited"].contains(&result.code())
+                } else {
+                    result.code() == "startup_timeout"
+                });
+                supervised.cleanup();
+                assert!(supervised.running.reaped && supervised.running.job.0.is_null());
+                let (stdout, stderr) = supervised.join().unwrap();
+                assert!(stdout.is_empty() && stderr.is_empty());
+                assert!(supervised.stdout.is_none() && supervised.stderr.is_none());
+            }
+        }
+        #[test]
+        fn startup_cancellation_and_unwind_join_readers_after_original_process_cleanup() {
+            let f = CoreFixture::new();
+            let request = startup_request(&f);
+            request.cancel.cancel();
+            let mut supervised =
+                Supervised::new(Running::start(command(&f.0, SyntheticCase::Wait)).unwrap())
+                    .unwrap();
+            assert_eq!(
+                await_startup(
+                    &mut supervised,
+                    &request,
+                    SyntheticCase::Wait,
+                    Instant::now(),
+                    true
+                )
+                .unwrap_err()
+                .code(),
+                "startup_cancelled"
+            );
+            supervised.cleanup();
+            supervised.join().unwrap();
+            drop(supervised);
+            let before = handles();
+            let running = Running::start(command(&f.0, SyntheticCase::Wait)).unwrap();
+            let probe = StartedChild {
+                process: running.child.as_handle().try_clone_to_owned().unwrap(),
+            };
+            assert!(probe.is_alive().unwrap());
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _supervised = Supervised::new(running).unwrap();
+                panic!("controlled callback unwind cleanup");
+            }));
+            assert!(unwound.is_err());
+            assert!(!probe.is_alive().unwrap());
+            drop(probe);
+            assert_eq!(handles(), before);
         }
         #[test]
         fn expired_deadline_stops_real_child_before_go() {

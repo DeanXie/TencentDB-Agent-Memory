@@ -1,6 +1,8 @@
 //! R4A test-only SCM host. No service installation, Gateway, issuer or verifier.
 //! Offline sinks exercise lifecycle logic; they do not prove actual SCM behavior.
+use crate::launch::{self, CancelToken, LaunchOutcome, LaunchReport, LaunchRequest, StartedChild};
 use std::{
+    cell::Cell,
     ffi::OsString,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     ptr::{null, null_mut},
@@ -59,6 +61,9 @@ pub struct ServiceSnapshot {
     pub win32_exit_code: u32,
     pub service_exit_code: u32,
 }
+/// A synchronous status reporter. RUNNING reports are serialized with STOP.
+/// A reporter must not wait for a concurrent STOP or synchronously reenter STOP
+/// on the same lifecycle; same-thread reentry is rejected instead of deadlocking.
 pub trait StatusSink {
     fn report(&mut self, snapshot: ServiceSnapshot) -> Result<(), ServiceError>;
 }
@@ -208,6 +213,21 @@ impl Event {
         }
     }
 }
+thread_local! {
+    // Pointer identity only, never dereferenced or used as an authorization fact.
+    static REPORTING_CONTROL: Cell<*const Control> = const { Cell::new(null()) };
+}
+struct ReportingControl(*const Control);
+impl ReportingControl {
+    fn enter(control: &Control) -> Self {
+        Self(REPORTING_CONTROL.with(|current| current.replace(control)))
+    }
+}
+impl Drop for ReportingControl {
+    fn drop(&mut self) {
+        REPORTING_CONTROL.with(|current| current.set(self.0));
+    }
+}
 struct Control {
     // Acceptance of cancellation, RUNNING publication and closure share this
     // lock. Lock order is transition -> event; the worker never takes transition.
@@ -217,8 +237,13 @@ struct Control {
     active: AtomicBool,
     fault: AtomicU32,
     event: Mutex<Option<Arc<Event>>>,
+    process_cancel: Mutex<Option<CancelToken>>,
     #[cfg(test)]
     before_ready: Mutex<Option<Arc<r4b_tests::Checkpoint>>>,
+    #[cfg(test)]
+    before_go: Mutex<Option<Arc<r4b_tests::Checkpoint>>>,
+    #[cfg(test)]
+    after_ack: Mutex<Option<Arc<r4b_tests::Checkpoint>>>,
 }
 impl Control {
     fn new() -> Self {
@@ -229,8 +254,13 @@ impl Control {
             active: AtomicBool::new(true),
             fault: AtomicU32::new(0),
             event: Mutex::new(None),
+            process_cancel: Mutex::new(None),
             #[cfg(test)]
             before_ready: Mutex::new(None),
+            #[cfg(test)]
+            before_go: Mutex::new(None),
+            #[cfg(test)]
+            after_ack: Mutex::new(None),
         }
     }
     fn install_event(&self) -> Result<Arc<Event>, ServiceError> {
@@ -261,7 +291,31 @@ impl Control {
             native_code: Some(ERROR_SERVICE_NOT_ACTIVE),
         }
     }
+    fn install_process_cancel(&self, cancel: CancelToken) -> Result<(), ServiceError> {
+        let _transition = self
+            .transition
+            .lock()
+            .map_err(|_| ServiceError::new("control_transition_poisoned"))?;
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Self::inactive());
+        }
+        let mut slot = self
+            .process_cancel
+            .lock()
+            .map_err(|_| ServiceError::new("control_lock_poisoned"))?;
+        if slot.is_some() {
+            return Err(ServiceError::new("duplicate_service_preparation"));
+        }
+        if self.stop.load(Ordering::SeqCst) {
+            cancel.cancel();
+        }
+        *slot = Some(cancel);
+        Ok(())
+    }
     fn request_stop(&self) -> Result<(), ServiceError> {
+        if REPORTING_CONTROL.with(|current| std::ptr::eq(current.get(), self)) {
+            return Err(ServiceError::new("reentrant_stop_not_allowed"));
+        }
         let _transition = match self.transition.lock() {
             Ok(guard) => guard,
             Err(poison) => {
@@ -283,6 +337,14 @@ impl Control {
         if self.stop.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        if let Some(cancel) = self
+            .process_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            cancel.cancel();
+        }
         let slot = self
             .event
             .lock()
@@ -303,6 +365,14 @@ impl Control {
         machine: &mut ServiceMachine,
         sink: &mut impl StatusSink,
     ) -> Result<bool, ServiceError> {
+        self.publish_ready_checked(machine, sink, || Ok(()))
+    }
+    fn publish_ready_checked(
+        &self,
+        machine: &mut ServiceMachine,
+        sink: &mut impl StatusSink,
+        check: impl FnOnce() -> Result<(), ServiceError>,
+    ) -> Result<bool, ServiceError> {
         let _transition = self
             .transition
             .lock()
@@ -313,8 +383,10 @@ impl Control {
         if self.stop.load(Ordering::SeqCst) {
             return Ok(false);
         }
+        check()?;
         // Hold the boundary through the synchronous status API result, so a
         // concurrently invoked STOP is accepted only before or after this report.
+        let _reporting = ReportingControl::enter(self);
         let result = machine.ready(sink);
         if result.is_err() {
             // Retain the original status error, including its native SCM code.
@@ -330,6 +402,10 @@ impl Control {
         let _ = self.stop_locked();
         // Poison is not authority: cleanup still owns and removes the resource.
         self.event.lock().unwrap_or_else(|p| p.into_inner()).take();
+        self.process_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -341,12 +417,57 @@ pub enum SyntheticServiceCase {
     StopFailure,
     WorkerExit,
 }
+/// Offline cancellation only; this object cannot control any SCM service.
+#[derive(Clone)]
+pub struct SyntheticProcessControl {
+    inner: Arc<Control>,
+}
+impl Default for SyntheticProcessControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl SyntheticProcessControl {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Control::new()),
+        }
+    }
+    /// Accept an offline STOP intent, serialized against RUNNING publication.
+    /// Calling this synchronously from this lifecycle's RUNNING StatusSink
+    /// returns `reentrant_stop_not_allowed` without accepting the intent.
+    /// The reporter must propagate that failure; it must not wait for another
+    /// thread's STOP while its synchronous report is in progress.
+    pub fn stop(&self) -> Result<(), ServiceError> {
+        match self.inner.request_stop() {
+            Err(e)
+                if e.code() == "service_not_active" && self.inner.stop.load(Ordering::SeqCst) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+}
+#[derive(Default)]
+struct ProcessState {
+    started: Option<StartedChild>,
+    report: Option<LaunchReport>,
+}
+fn launch_failure(error: launch::LaunchError) -> ServiceError {
+    ServiceError {
+        code: error.code(),
+        native_code: error.os_error.map(|n| n as u32),
+    }
+}
 struct Worker {
     thread: Option<JoinHandle<Result<(), ServiceError>>>,
     ready: Option<Arc<Event>>,
     startup: Arc<Mutex<Option<Result<(), ServiceError>>>>,
     control: Arc<Control>,
     joined: bool,
+    process: Option<Arc<Mutex<ProcessState>>>,
+    ready_timeout: Duration,
 }
 impl Worker {
     fn start(
@@ -396,10 +517,137 @@ impl Worker {
             startup,
             control,
             joined: false,
+            process: None,
+            ready_timeout: Duration::from_secs(2),
         })
     }
+    fn start_process(
+        control: Arc<Control>,
+        request: LaunchRequest,
+        state: Arc<Mutex<ProcessState>>,
+    ) -> Result<Self, ServiceError> {
+        let _stop_event = control.install_event()?;
+        let ready = Arc::new(Event::new()?);
+        let startup = Arc::new(Mutex::new(None));
+        let thread_ready = ready.clone();
+        let thread_startup = startup.clone();
+        let thread_control = control.clone();
+        let thread_state = state.clone();
+        let cancel = request.cancel.clone();
+        let ready_timeout = request.timeout + Duration::from_millis(500);
+        let thread = thread::Builder::new()
+            .name("offline-synthetic-process".into())
+            .spawn(move || {
+                let mut on_ready = |started| {
+                    if thread_control.stop.load(Ordering::SeqCst) {
+                        return Err(launch::error("startup_cancelled"));
+                    }
+                    let accepted = (|| {
+                        thread_state
+                            .lock()
+                            .map_err(|_| ServiceError::new("worker_lock_poisoned"))?
+                            .started = Some(started);
+                        *thread_startup
+                            .lock()
+                            .map_err(|_| ServiceError::new("worker_lock_poisoned"))? = Some(Ok(()));
+                        thread_ready.set()?;
+                        #[cfg(test)]
+                        if let Some(point) = thread_control.after_ack.lock().unwrap().clone() {
+                            point.hit()?;
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = accepted {
+                        *thread_startup.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(Err(error));
+                        cancel.cancel();
+                        return Err(launch::error("startup_callback_failed"));
+                    }
+                    Ok(())
+                };
+                #[cfg(test)]
+                let result = {
+                    let point = thread_control.before_go.lock().unwrap().clone();
+                    if let Some(point) = point {
+                        launch::launch_with_startup_observed(request, &mut on_ready, &mut |_| {
+                            point.hit().expect("bounded before-GO schedule");
+                        })
+                    } else {
+                        launch::launch_with_startup(request, &mut on_ready)
+                    }
+                };
+                #[cfg(not(test))]
+                let result = launch::launch_with_startup(request, &mut on_ready);
+                let completion = match result {
+                    Ok(report) => {
+                        let stopped = thread_control.stop.load(Ordering::SeqCst);
+                        let outcome = match report.outcome {
+                            LaunchOutcome::Aborted if stopped => Ok(()),
+                            LaunchOutcome::TimedOut => {
+                                Err(ServiceError::new("synthetic_process_timeout"))
+                            }
+                            _ => Err(ServiceError::new("synthetic_process_exited")),
+                        };
+                        thread_state
+                            .lock()
+                            .map_err(|_| ServiceError::new("worker_lock_poisoned"))?
+                            .report = Some(report);
+                        outcome
+                    }
+                    Err(error)
+                        if thread_control.stop.load(Ordering::SeqCst)
+                            && matches!(
+                                error.code(),
+                                "cancelled_before_spawn" | "startup_cancelled"
+                            ) =>
+                    {
+                        Ok(())
+                    }
+                    Err(error) => Err(launch_failure(error)),
+                };
+                let mut status = thread_startup
+                    .lock()
+                    .map_err(|_| ServiceError::new("worker_lock_poisoned"))?;
+                if status.is_none() {
+                    *status = Some(match &completion {
+                        Ok(()) => Err(ServiceError::new("synthetic_process_cancelled")),
+                        Err(error) => Err(error.clone()),
+                    });
+                    thread_ready.set()?;
+                }
+                completion
+            })
+            .map_err(|e| ServiceError {
+                code: "worker_create_failed",
+                native_code: e.raw_os_error().map(|n| n as u32),
+            })?;
+        Ok(Self {
+            thread: Some(thread),
+            ready: Some(ready),
+            startup,
+            control,
+            joined: false,
+            process: Some(state),
+            ready_timeout,
+        })
+    }
+    fn ensure_process_alive(&self) -> Result<(), ServiceError> {
+        if let Some(state) = &self.process {
+            let state = state
+                .lock()
+                .map_err(|_| ServiceError::new("worker_lock_poisoned"))?;
+            let child = state
+                .started
+                .as_ref()
+                .ok_or_else(|| ServiceError::new("worker_not_ready"))?;
+            if !child.is_alive().map_err(launch_failure)? {
+                return Err(ServiceError::new("startup_child_exited"));
+            }
+        }
+        Ok(())
+    }
     fn await_ready(&self) -> Result<(), ServiceError> {
-        let end = Instant::now() + Duration::from_secs(2);
+        let end = Instant::now() + self.ready_timeout;
         loop {
             if self
                 .ready
@@ -416,6 +664,14 @@ impl Worker {
                     .clone();
             }
             if self.finished() || Instant::now() >= end {
+                if let Some(result) = self
+                    .startup
+                    .lock()
+                    .map_err(|_| ServiceError::new("worker_lock_poisoned"))?
+                    .as_ref()
+                {
+                    return result.clone();
+                }
                 return Err(ServiceError::new("worker_not_ready"));
             }
         }
@@ -432,6 +688,13 @@ impl Worker {
             Ok(())
         };
         self.ready.take();
+        if let Some(state) = &self.process {
+            state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .started
+                .take();
+        }
         result
     }
 }
@@ -455,10 +718,23 @@ pub struct SyntheticServiceReport {
     pub resources_released: bool,
     pub prepared_before_running: bool,
 }
+#[derive(Debug)]
+pub struct SyntheticProcessReport {
+    pub lifecycle: SyntheticServiceReport,
+    pub launch: Option<LaunchReport>,
+}
 fn run_engine(
     sink: &mut impl StatusSink,
     control: Arc<Control>,
     case: Option<SyntheticServiceCase>,
+) -> Result<SyntheticServiceReport, ServiceError> {
+    run_engine_with_process(sink, control, case, None)
+}
+fn run_engine_with_process(
+    sink: &mut impl StatusSink,
+    control: Arc<Control>,
+    case: Option<SyntheticServiceCase>,
+    process: Option<(LaunchRequest, Arc<Mutex<ProcessState>>)>,
 ) -> Result<SyntheticServiceReport, ServiceError> {
     let _cleanup = EngineCleanup(control.clone());
     let mut machine = ServiceMachine::new();
@@ -466,11 +742,21 @@ fn run_engine(
     let mut prepared = false;
     let attempt = (|| {
         machine.start(sink)?;
-        worker = Some(Worker::start(control.clone(), case)?);
+        worker = Some(if let Some((request, state)) = process {
+            Worker::start_process(control.clone(), request, state)?
+        } else {
+            Worker::start(control.clone(), case)?
+        });
         if case == Some(SyntheticServiceCase::StopDuringStartup) {
             control.request_stop()?;
         }
-        worker.as_ref().unwrap().await_ready()?;
+        if let Err(error) = worker.as_ref().unwrap().await_ready() {
+            if error.code() == "synthetic_process_cancelled" && control.stop.load(Ordering::SeqCst)
+            {
+                return Ok(());
+            }
+            return Err(error);
+        }
         if control.stop.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -483,7 +769,15 @@ fn run_engine(
         }
         #[cfg(test)]
         r4b_tests::before_ready(&control)?;
-        prepared = control.publish_ready(&mut machine, sink)?;
+        prepared = if worker.as_ref().unwrap().process.is_some() {
+            // The live process probe is taken inside the same boundary as STOP
+            // acceptance and status publication. It is not loaded-code attestation.
+            control.publish_ready_checked(&mut machine, sink, || {
+                worker.as_ref().unwrap().ensure_process_alive()
+            })?
+        } else {
+            control.publish_ready(&mut machine, sink)?
+        };
         if !prepared {
             return Ok(());
         }
@@ -570,6 +864,25 @@ pub fn run_synthetic_lifecycle(
     case: SyntheticServiceCase,
 ) -> Result<SyntheticServiceReport, ServiceError> {
     run_engine(sink, Arc::new(Control::new()), Some(case))
+}
+/// Offline, fixed R2 payload only. No SCM entry, runtime authority, or R3 connection.
+pub fn run_synthetic_process_lifecycle(
+    sink: &mut impl StatusSink,
+    request: LaunchRequest,
+    control: SyntheticProcessControl,
+) -> Result<SyntheticProcessReport, ServiceError> {
+    control
+        .inner
+        .install_process_cancel(request.cancel.clone())?;
+    let state = Arc::new(Mutex::new(ProcessState::default()));
+    let lifecycle =
+        run_engine_with_process(sink, control.inner, None, Some((request, state.clone())))?;
+    let launch = state
+        .lock()
+        .map_err(|_| ServiceError::new("worker_lock_poisoned"))?
+        .report
+        .take();
+    Ok(SyntheticProcessReport { lifecycle, launch })
 }
 struct NativeSink(SERVICE_STATUS_HANDLE);
 impl StatusSink for NativeSink {
@@ -736,7 +1049,7 @@ mod r4b_tests {
         )
     }
     impl Checkpoint {
-        fn hit(&self) -> Result<(), ServiceError> {
+        pub(super) fn hit(&self) -> Result<(), ServiceError> {
             self.arrived
                 .send(())
                 .map_err(|_| ServiceError::new("test_schedule_disconnected"))?;
@@ -1131,6 +1444,11 @@ mod r4b_tests {
                     "cleanup cannot reopen lifecycle"
                 );
             }
+            "process_before_go" => process_schedule("before_go"),
+            "process_after_ack" => process_schedule("after_ack"),
+            "process_simultaneous" => process_schedule("simultaneous_process"),
+            "process_panic" => process_panic_cleanup(),
+            "process_reentrant_stop" => process_reentrant_stop(),
             _ => panic!("unknown fixed test scenario"),
         }
     }
@@ -1209,4 +1527,271 @@ mod r4b_tests {
     isolated_test!(closed_lifecycle_rejects_callbacks, "closed_callbacks");
     isolated_test!(parallel_cleanup_releases_event_once, "cleanup");
     isolated_test!(worker_exit_survives_cancel_race, "worker_exit");
+
+    use crate::launch::{
+        LaunchTarget, SyntheticCase, NODE_TEST_TOOL, SYNTHETIC_ENTRY, SYNTHETIC_ENTRY_SOURCE,
+        SYNTHETIC_PACKAGE,
+    };
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+    use std::{fs, path::PathBuf, sync::atomic::AtomicU64};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    fn hash(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+    struct RaceFixture {
+        root: PathBuf,
+        manifest: Value,
+    }
+    impl RaceFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "service-process-race-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            let graph=serde_json::to_vec(&json!({"format":"gateway-js-dependency-staging/v1","edges":[{"status":"UNRESOLVED"}],"TRANSITIVE_CLOSURE_PROVEN":false,"NATIVE_LOAD_VERIFIED":false,"DEVELOPMENT_PATH_ESCAPE":false})).unwrap();
+            let node = json!({"version":"v24.16.0","platform":"win32","architecture":"x64","moduleABI":"137","napi":"10","runtimeCompatibility":"NOT_LOAD_VERIFIED"});
+            let build = json!({"name":"esbuild","version":"0.28.2","typescriptVersion":"6.0.3","lockVersionMatched":true,"lockSha256":"1".repeat(64),"jsEntrypoints":[{"path":"node_modules/esbuild/lib/main.js","bytes":1,"sha256":"2".repeat(64)}],"executableIdentity":{"bytes":1,"sha256":"3".repeat(64)},"transformCalls":1});
+            let report=serde_json::to_vec(&json!({"format":"gateway-js-candidate-closure/v1","entryOutput":SYNTHETIC_ENTRY,"CANDIDATE_BUILD_SUCCESS":true,"buildExitCode":0,"buildTool":build,"node":node,"jsDependencyStaging":{"graphPath":"js-dependency-graph.json","graphSha256":hash(&graph),"unresolvedEdges":1,"TRANSITIVE_CLOSURE_PROVEN":false,"NATIVE_LOAD_VERIFIED":false,"DEVELOPMENT_PATH_ESCAPE":false},"closureGateExitCode":2,"RELEASE_ELIGIBLE":false,"RELEASE_DEPENDENCY_CLOSURE_COMPLETE":false})).unwrap();
+            let files = [
+                ("app/package.json", SYNTHETIC_PACKAGE.as_bytes(), "metadata"),
+                (
+                    SYNTHETIC_ENTRY,
+                    SYNTHETIC_ENTRY_SOURCE.as_bytes(),
+                    "gateway-js",
+                ),
+                ("closure-report.json", report.as_slice(), "report"),
+                ("js-dependency-graph.json", graph.as_slice(), "report"),
+            ]
+            .into_iter()
+            .map(|(p, b, k)| {
+                let f = root.join(p);
+                fs::create_dir_all(f.parent().unwrap()).unwrap();
+                fs::write(f, b).unwrap();
+                json!({"path":p,"size":b.len(),"sha256":hash(b),"kind":k})
+            })
+            .collect::<Vec<_>>();
+            for name in ["temp", "work"] {
+                fs::create_dir(root.join(name)).unwrap();
+            }
+            let manifest = json!({"format_version":2,"platform":"windows","architecture":"x86_64","validation_scope":"candidate-static-tree","production_eligible":false,"entry":SYNTHETIC_ENTRY,"node":node,"node_identity_scope":"reported-target-not-packaged","build_tool":build,"closure":{"path":"closure-report.json","sha256":hash(&report),"graph_path":"js-dependency-graph.json","graph_sha256":hash(&graph),"unresolved_edges":1},"runtime":{"dependency_closure_proven":false,"native_load_verified":false,"config_isolation":false,"protected_service":false,"trusted_issuer":false},"directories":["app","app/src","app/src/gateway","temp","work"],"files":files});
+            Self { root, manifest }
+        }
+        fn request(&self, case: SyntheticCase) -> LaunchRequest {
+            LaunchRequest {
+                target: LaunchTarget::Synthetic(case),
+                release_root: self.root.clone(),
+                manifest: serde_json::to_vec(&self.manifest).unwrap(),
+                executable: PathBuf::from(NODE_TEST_TOOL),
+                entry: SYNTHETIC_ENTRY.into(),
+                arguments: vec![],
+                working_directory: self.root.join("work"),
+                environment_overrides: vec![],
+                timeout: Duration::from_secs(2),
+                cancel: CancelToken::new(),
+            }
+        }
+    }
+    impl Drop for RaceFixture {
+        fn drop(&mut self) {
+            assert!(self.root.starts_with(std::env::temp_dir()));
+            fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    fn process_schedule(name: &str) {
+        let fixture = RaceFixture::new();
+        let control = SyntheticProcessControl::new();
+        let trace = Trace::default();
+        let (point, arrived, release) = checkpoint();
+        let ack_schedule = if name == "after_ack" {
+            let (point, arrived, release) = checkpoint();
+            *control.inner.after_ack.lock().unwrap() = Some(point);
+            Some((arrived, release))
+        } else {
+            None
+        };
+        if name == "before_go" {
+            *control.inner.before_go.lock().unwrap() = Some(point);
+        } else {
+            *control.inner.before_ready.lock().unwrap() = Some(point);
+        }
+        let mut request = fixture.request(SyntheticCase::Wait);
+        request.timeout = Duration::from_secs(4);
+        let c = control.clone();
+        let mut output = sink(&trace);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let runner = thread::spawn(move || {
+            tx.send(run_synthetic_process_lifecycle(&mut output, request, c))
+                .unwrap();
+        });
+        arrive(&arrived);
+        if let Some((arrived, _)) = &ack_schedule {
+            // The process worker is still inside its accepted-ACK callback,
+            // while the lifecycle thread has not yet published RUNNING.
+            arrive(arrived);
+        }
+        if name == "simultaneous_process" {
+            let gate = Arc::new(Barrier::new(3));
+            let g = gate.clone();
+            let c = control.clone();
+            let stopper = thread::spawn(move || {
+                g.wait();
+                c.stop().unwrap();
+            });
+            let g = gate.clone();
+            let releaser = thread::spawn(move || {
+                g.wait();
+                release.send(()).unwrap();
+            });
+            gate.wait();
+            stopper.join().unwrap();
+            releaser.join().unwrap();
+        } else {
+            stop(&control.inner, &trace);
+            release.send(()).unwrap();
+        }
+        if let Some((_, release)) = ack_schedule {
+            release.send(()).unwrap();
+        }
+        let report = rx
+            .recv_timeout(Duration::from_secs(4))
+            .expect("bounded process cleanup")
+            .unwrap();
+        runner.join().unwrap();
+        assert!(report.lifecycle.worker_joined && report.lifecycle.resources_released);
+        if name != "simultaneous_process" {
+            assert!(!trace
+                .states
+                .lock()
+                .unwrap()
+                .contains(&ServicePhase::Running));
+            assert!(!report.lifecycle.prepared_before_running);
+        }
+        if name != "before_go" {
+            let launch = report
+                .launch
+                .expect("ACK was observed before READY checkpoint");
+            assert!(launch.startup_confirmed && launch.output_readers_joined);
+            assert!(launch.process_reaped && launch.job_closed);
+            assert_eq!(launch.outcome, LaunchOutcome::Aborted);
+        }
+        assert_closed(&trace);
+    }
+
+    #[test]
+    fn stop_before_go_cancels_real_suspended_child() {
+        isolated("process_before_go");
+    }
+    #[test]
+    fn stop_after_ack_suppresses_late_running() {
+        isolated("process_after_ack");
+    }
+    #[test]
+    fn simultaneous_process_ready_stop_is_linearized() {
+        isolated("process_simultaneous");
+    }
+    fn process_panic_cleanup() {
+        struct PanickingSink;
+        impl StatusSink for PanickingSink {
+            fn report(&mut self, snapshot: ServiceSnapshot) -> Result<(), ServiceError> {
+                if snapshot.phase == ServicePhase::Running {
+                    panic!("offline process status unwind");
+                }
+                Ok(())
+            }
+        }
+        let fixture = RaceFixture::new();
+        let request = fixture.request(SyntheticCase::Wait);
+        let control = Arc::new(Control::new());
+        control
+            .install_process_cancel(request.cancel.clone())
+            .unwrap();
+        let state = Arc::new(Mutex::new(ProcessState::default()));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_engine_with_process(
+                &mut PanickingSink,
+                control.clone(),
+                None,
+                Some((request, state.clone())),
+            )
+        }));
+        assert!(outcome.is_err());
+        assert!(!control.active.load(Ordering::SeqCst));
+        assert!(control.event.lock().unwrap().is_none());
+        assert!(control.process_cancel.lock().unwrap().is_none());
+        let mut state = state.lock().unwrap();
+        assert!(
+            state.started.is_none(),
+            "duplicate process probe must be closed"
+        );
+        let report = state
+            .report
+            .take()
+            .expect("process worker joined during unwind");
+        assert!(report.process_reaped && report.job_closed && report.output_readers_joined);
+        assert_eq!(report.outcome, LaunchOutcome::Aborted);
+    }
+    #[test]
+    fn process_status_unwind_reaps_child_and_joins_readers() {
+        isolated("process_panic");
+    }
+    fn process_reentrant_stop() {
+        struct ReentrantSink {
+            control: SyntheticProcessControl,
+            states: Vec<ServicePhase>,
+        }
+        impl StatusSink for ReentrantSink {
+            fn report(&mut self, snapshot: ServiceSnapshot) -> Result<(), ServiceError> {
+                if snapshot.phase == ServicePhase::Running {
+                    return self.control.stop();
+                }
+                self.states.push(snapshot.phase);
+                Ok(())
+            }
+        }
+        let fixture = RaceFixture::new();
+        let request = fixture.request(SyntheticCase::Wait);
+        let control = SyntheticProcessControl::new();
+        let state = Arc::new(Mutex::new(ProcessState::default()));
+        control
+            .inner
+            .install_process_cancel(request.cancel.clone())
+            .unwrap();
+        let mut sink = ReentrantSink {
+            control: control.clone(),
+            states: vec![],
+        };
+        let error = run_engine_with_process(
+            &mut sink,
+            control.inner.clone(),
+            None,
+            Some((request, state.clone())),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "reentrant_stop_not_allowed");
+        assert_eq!(
+            sink.states,
+            vec![
+                ServicePhase::StartPending,
+                ServicePhase::StopPending,
+                ServicePhase::Stopped
+            ]
+        );
+        let mut state = state.lock().unwrap();
+        assert!(state.started.is_none());
+        let report = state
+            .report
+            .take()
+            .expect("worker joined after failed status report");
+        assert!(report.process_reaped && report.job_closed && report.output_readers_joined);
+        assert_eq!(report.outcome, LaunchOutcome::Aborted);
+        assert!(REPORTING_CONTROL.with(|current| current.get().is_null()));
+    }
+    #[test]
+    fn process_sink_stop_reentry_fails_without_deadlock_and_cleans_up() {
+        isolated("process_reentrant_stop");
+    }
 }

@@ -155,6 +155,27 @@ fn timeout_terminates_and_reaps_real_child() {
     println!("SYNTHETIC_TIMEOUT_TERMINATED_AND_REAPED=true");
 }
 #[test]
+fn waiting_payload_confirms_startup_and_joins_both_output_readers() {
+    let f = Fixture::new();
+    let mut request = f.request(SyntheticCase::Wait);
+    request.timeout = Duration::from_millis(400);
+    let report = launch_synthetic(request).unwrap();
+    let observed: Value = serde_json::from_str(report.stdout.trim()).unwrap();
+    assert_eq!(observed["scenario"], "wait");
+    assert_eq!(report.outcome, LaunchOutcome::TimedOut);
+    assert!(report.process_reaped && report.job_closed);
+    let facts = format!("{report:?}");
+    assert!(
+        facts.contains("startup_confirmed: true"),
+        "a running fixed payload must have its startup acknowledgement validated: {facts}"
+    );
+    assert!(
+        facts.contains("output_readers_joined: true"),
+        "both bounded output readers must be joined after process cleanup: {facts}"
+    );
+    assert!(report.startup_confirmed && report.output_readers_joined);
+}
+#[test]
 fn cooperative_abort_terminates_and_reaps_real_child() {
     let f = Fixture::new();
     let q = f.request(SyntheticCase::Wait);

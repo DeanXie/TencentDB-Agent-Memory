@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_runtime_boundary::peer::*;
+use windows_runtime_boundary::CancelToken;
 use windows_sys::Win32::System::Pipes::{GetNamedPipeHandleStateW, PIPE_NOWAIT};
 use windows_sys::Win32::{
     Foundation::*, Security::Authorization::*, Security::*, System::Threading::*,
@@ -11,6 +12,7 @@ use windows_sys::Win32::{
 use windows_sys::Win32::{Storage::FileSystem::*, System::Pipes::GetNamedPipeClientProcessId};
 
 const WAIT: Duration = Duration::from_secs(3);
+
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -93,6 +95,10 @@ fn peer_child_entry() {
     )
     .unwrap();
     let role = std::env::var("R3_ROLE").unwrap();
+    if role.starts_with("cancel_") {
+        cancel_child_role(&name, &parent, &role);
+        return;
+    }
     if role == "silent" {
         let wide = name
             .as_str()
@@ -637,4 +643,749 @@ fn rejection_and_timeout_paths_release_handles() {
         );
         println!("R3_REJECTION_HANDLE_RECEIPT=before:{before};after:{after};cases:15");
     }
+}
+
+#[test]
+fn cancel_pre_cancelled_accept_rejects_without_waiting() {
+    let server = TestPipeServer::bind().unwrap();
+    let name = server.name().clone();
+    let expected = PinnedProcess::current().unwrap();
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let error = server
+        .accept_cancellable(
+            &expected,
+            &TestPeerPolicy::current().unwrap(),
+            Duration::from_millis(100),
+            &cancel,
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "peer_cancelled");
+    assert!(TestPipeServer::bind_name(name).is_ok());
+    assert_server_token_restored();
+}
+
+#[test]
+fn cancel_accept_wait_observes_same_r2_token_before_deadline() {
+    let server = TestPipeServer::bind().unwrap();
+    let name = server.name().clone();
+    let cancel = CancelToken::new();
+    let worker_cancel = cancel.clone();
+    let (entered, entry) = std::sync::mpsc::sync_channel(1);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        let expected = PinnedProcess::current().unwrap();
+        entered.send(()).unwrap();
+        let result = server
+            .accept_cancellable(
+                &expected,
+                &TestPeerPolicy::current().unwrap(),
+                Duration::from_millis(1500),
+                &worker_cancel,
+            )
+            .map(|_| ());
+        assert_server_token_restored();
+        tx.send(result).unwrap();
+    });
+    entry.recv_timeout(WAIT).unwrap();
+    assert!(
+        rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "real accept must still be waiting"
+    );
+    let start = Instant::now();
+    cancel.cancel();
+    let result = rx.recv_timeout(WAIT).unwrap();
+    worker.join().unwrap();
+    assert_eq!(result.unwrap_err().code(), "peer_cancelled");
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(TestPipeServer::bind_name(name).is_ok());
+}
+
+#[test]
+fn cancel_after_challenge_rejects_late_real_response() {
+    let server = TestPipeServer::bind().unwrap();
+    let mut child = child(server.name(), "valid", None);
+    let expected = PinnedProcess::from_child(&child.0).unwrap();
+    let cancel = CancelToken::new();
+    let mut session = server
+        .accept_cancellable(
+            &expected,
+            &TestPeerPolicy::current().unwrap(),
+            WAIT,
+            &cancel,
+        )
+        .unwrap();
+    session.issue_challenge(Duration::from_secs(1)).unwrap();
+    cancel.cancel();
+    assert_eq!(
+        session.verify_response().unwrap_err().code(),
+        "peer_cancelled"
+    );
+    assert!(session.verify_response().is_err());
+    assert_server_token_restored();
+    // Cancellation closes the pipe; this valid legacy client must observe failure.
+    // Drop owns only this synthetic child, even when the RED assertion unwinds.
+    let _ = child.0.kill();
+    let _ = child.0.wait();
+}
+
+// Fixed synthetic roles, with stdin gates and bounded parent-side waits. The
+// fixture kills/reaps its own child before joining its sole stdout reader.
+struct ControlledPeer {
+    child: ChildGuard,
+    lines: std::sync::mpsc::Receiver<String>,
+    reader: Option<thread::JoinHandle<()>>,
+}
+impl ControlledPeer {
+    fn new(name: &PipeName, role: &str) -> Self {
+        use std::io::BufRead;
+        let parent = PinnedProcess::current().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "peer_child_entry", "--ignored", "--nocapture"])
+            .env_clear()
+            .env("SystemRoot", "C:\\Windows")
+            .env("R3_ROLE", role)
+            .env("R3_PIPE", name.as_str())
+            .env("R3_PARENT", parent.id().to_string())
+            .env("R3_CREATED", parent.creation_time().to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = ChildGuard(command.spawn().unwrap());
+        let stdout = child.0.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) => {
+                        if tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            child,
+            lines,
+            reader: Some(reader),
+        }
+    }
+    fn step(&self, marker: &str) {
+        let end = Instant::now() + WAIT;
+        loop {
+            let line = self
+                .lines
+                .recv_timeout(end.saturating_duration_since(Instant::now()))
+                .expect("bounded synthetic child progress");
+            if line.contains(marker) {
+                return;
+            }
+        }
+    }
+    fn go(&mut self) {
+        use std::io::Write;
+        self.child
+            .0
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"G")
+            .unwrap();
+    }
+    fn finish(&mut self) {
+        finish(&mut self.child);
+    }
+}
+impl Drop for ControlledPeer {
+    fn drop(&mut self) {
+        let _ = self.child.0.kill();
+        let _ = self.child.0.wait();
+        self.child.0.stdin.take();
+        if let Some(reader) = self.reader.take() {
+            reader.join().unwrap();
+        }
+    }
+}
+fn child_gate() {
+    use std::io::Read;
+    let mut byte = [0];
+    std::io::stdin().read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [b'G']);
+}
+fn child_step(marker: &str) {
+    use std::io::Write;
+    println!("R3_CANCEL_{marker}");
+    std::io::stdout().flush().unwrap();
+}
+fn cancel_child_role(name: &PipeName, parent: &PinnedProcess, role: &str) {
+    if role.starts_with("cancel_server_") {
+        let server = TestPipeServer::bind_name(name.clone()).unwrap();
+        child_step("BOUND");
+        let mut session = server
+            .accept(parent, &TestPeerPolicy::current().unwrap(), WAIT)
+            .unwrap();
+        if role == "cancel_server_ack" {
+            session.issue_challenge(Duration::from_secs(2)).unwrap();
+        }
+        child_step("ACCEPTED");
+        child_gate();
+        if role == "cancel_server_ack" {
+            assert!(session.verify_response().is_err());
+        }
+        return;
+    }
+    if role == "cancel_no_hello" {
+        let wide = name
+            .as_str()
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                0x0012019b,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(raw, INVALID_HANDLE_VALUE);
+        child_step("CONNECTED");
+        child_gate();
+        unsafe {
+            CloseHandle(raw);
+        }
+        return;
+    }
+    let mut client =
+        TestPipeClient::connect(name, parent, ClientTokenQuality::Impersonation, WAIT).unwrap();
+    if role == "cancel_expect_closed" {
+        assert!(client.challenge().is_err());
+        return;
+    }
+    if role == "cancel_partial" {
+        client.send_test_length(128).unwrap();
+        child_step("PARTIAL");
+        child_gate();
+        assert!(client.send_test_frame(b"late").is_err());
+        child_step("LATE_REJECTED");
+        return;
+    }
+    let challenge = client.challenge().unwrap();
+    child_step("CHALLENGE");
+    child_gate();
+    let result = client.respond(&challenge);
+    if role == "cancel_late" {
+        assert!(result.is_err());
+        child_step("LATE_REJECTED");
+    } else if role == "cancel_valid" {
+        result.unwrap();
+    } else {
+        assert_eq!(role, "cancel_race");
+    }
+    let _ = client.wait_for_close();
+}
+
+#[test]
+fn cancel_client_connect_wait_is_bounded() {
+    let name = PipeName::random().unwrap();
+    let cancel = CancelToken::new();
+    let token = cancel.clone();
+    let (entered, rx_entered) = std::sync::mpsc::sync_channel(1);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        let expected = PinnedProcess::current().unwrap();
+        entered.send(()).unwrap();
+        tx.send(
+            TestPipeClient::connect_cancellable(
+                &name,
+                &expected,
+                ClientTokenQuality::Impersonation,
+                WAIT,
+                &token,
+            )
+            .map(|_| ()),
+        )
+        .unwrap();
+    });
+    rx_entered.recv_timeout(WAIT).unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+    cancel.cancel();
+    let result = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    worker.join().unwrap();
+    assert_eq!(result.unwrap_err().code(), "peer_cancelled");
+}
+
+#[test]
+fn cancel_connected_hello_read_closes_server_pipe() {
+    let server = TestPipeServer::bind().unwrap();
+    let name = server.name().clone();
+    let mut child = ControlledPeer::new(&name, "cancel_no_hello");
+    child.step("R3_CANCEL_CONNECTED");
+    let expected = PinnedProcess::from_child(&child.child.0).unwrap();
+    let cancel = CancelToken::new();
+    thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let token = cancel.clone();
+        let expected = &expected;
+        let worker = scope.spawn(move || {
+            let result = server
+                .accept_cancellable(expected, &TestPeerPolicy::current().unwrap(), WAIT, &token)
+                .map(|_| ());
+            assert_server_token_restored();
+            tx.send(result).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        cancel.cancel();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .code(),
+            "peer_cancelled"
+        );
+        worker.join().unwrap();
+    });
+    child.go();
+    child.finish();
+    assert!(TestPipeServer::bind_name(name).is_ok());
+}
+
+#[test]
+fn cancel_partial_frame_read_and_late_bytes_are_rejected() {
+    let server = TestPipeServer::bind().unwrap();
+    let mut child = ControlledPeer::new(server.name(), "cancel_partial");
+    let expected = PinnedProcess::from_child(&child.child.0).unwrap();
+    let cancel = CancelToken::new();
+    let mut session = server
+        .accept_cancellable(
+            &expected,
+            &TestPeerPolicy::current().unwrap(),
+            WAIT,
+            &cancel,
+        )
+        .unwrap();
+    session.issue_challenge(Duration::from_secs(2)).unwrap();
+    child.step("R3_CANCEL_PARTIAL");
+    thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let s = &mut session;
+        let worker = scope.spawn(move || {
+            let result = s.verify_response();
+            assert_server_token_restored();
+            tx.send(result).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        cancel.cancel();
+        cancel.cancel();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .code(),
+            "peer_cancelled"
+        );
+        worker.join().unwrap();
+    });
+    assert_eq!(
+        session.verify_response().unwrap_err().code(),
+        "session_closed"
+    );
+    child.go();
+    child.step("R3_CANCEL_LATE_REJECTED");
+    child.finish();
+}
+
+#[test]
+fn cancel_waiting_challenge_response_rejects_late_authentication() {
+    let server = TestPipeServer::bind().unwrap();
+    let mut child = ControlledPeer::new(server.name(), "cancel_late");
+    let expected = PinnedProcess::from_child(&child.child.0).unwrap();
+    let cancel = CancelToken::new();
+    let mut session = server
+        .accept_cancellable(
+            &expected,
+            &TestPeerPolicy::current().unwrap(),
+            WAIT,
+            &cancel,
+        )
+        .unwrap();
+    session.issue_challenge(Duration::from_secs(2)).unwrap();
+    child.step("R3_CANCEL_CHALLENGE");
+    thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let s = &mut session;
+        let worker = scope.spawn(move || {
+            tx.send(s.verify_response()).unwrap();
+            assert_server_token_restored();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        cancel.cancel();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .code(),
+            "peer_cancelled"
+        );
+        worker.join().unwrap();
+    });
+    assert!(session.issue_challenge(Duration::from_secs(1)).is_err());
+    child.go();
+    child.step("R3_CANCEL_LATE_REJECTED");
+    child.finish();
+}
+
+#[test]
+fn cancel_client_challenge_read_closes_owned_pipe() {
+    let name = PipeName::random().unwrap();
+    let mut child = ControlledPeer::new(&name, "cancel_server_idle");
+    child.step("R3_CANCEL_BOUND");
+    let expected = PinnedProcess::from_child(&child.child.0).unwrap();
+    let cancel = CancelToken::new();
+    let mut client = TestPipeClient::connect_cancellable(
+        &name,
+        &expected,
+        ClientTokenQuality::Impersonation,
+        WAIT,
+        &cancel,
+    )
+    .unwrap();
+    child.step("R3_CANCEL_ACCEPTED");
+    thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let c = &mut client;
+        let worker = scope.spawn(move || {
+            tx.send(c.challenge()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        cancel.cancel();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .code(),
+            "peer_cancelled"
+        );
+        worker.join().unwrap();
+    });
+    assert_eq!(client.challenge().unwrap_err().code(), "session_closed");
+    child.go();
+    child.finish();
+}
+
+#[test]
+fn cancel_client_waiting_ack_is_not_authentication_success() {
+    let name = PipeName::random().unwrap();
+    let mut child = ControlledPeer::new(&name, "cancel_server_ack");
+    child.step("R3_CANCEL_BOUND");
+    let expected = PinnedProcess::from_child(&child.child.0).unwrap();
+    let cancel = CancelToken::new();
+    let mut client = TestPipeClient::connect_cancellable(
+        &name,
+        &expected,
+        ClientTokenQuality::Impersonation,
+        WAIT,
+        &cancel,
+    )
+    .unwrap();
+    child.step("R3_CANCEL_ACCEPTED");
+    let challenge = client.challenge().unwrap();
+    thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let c = &mut client;
+        let worker = scope.spawn(move || {
+            tx.send(c.respond(&challenge)).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        cancel.cancel();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .code(),
+            "peer_cancelled"
+        );
+        worker.join().unwrap();
+    });
+    child.go();
+    child.finish();
+}
+
+#[test]
+fn cancel_full_pipe_write_is_bounded_and_closes_client() {
+    let name = PipeName::random().unwrap();
+    let mut child = ControlledPeer::new(&name, "cancel_server_idle");
+    child.step("R3_CANCEL_BOUND");
+    let expected = PinnedProcess::from_child(&child.child.0).unwrap();
+    let cancel = CancelToken::new();
+    let mut client = TestPipeClient::connect_cancellable(
+        &name,
+        &expected,
+        ClientTokenQuality::Impersonation,
+        WAIT,
+        &cancel,
+    )
+    .unwrap();
+    child.step("R3_CANCEL_ACCEPTED");
+    thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (written, first_write) = std::sync::mpsc::sync_channel(1);
+        let c = &mut client;
+        let worker = scope.spawn(move || {
+            let result = (|| {
+                c.send_test_frame(&[7; 64])?;
+                written.send(()).unwrap();
+                (0..10_000).try_for_each(|_| c.send_test_frame(&[7; 64]))
+            })();
+            tx.send(result).unwrap();
+        });
+        // Prove the worker has performed real writes before cancelling; this is
+        // not merely a worker that has yet to be scheduled. The peer deliberately
+        // does not drain its finite buffer, so this write sequence cannot finish.
+        first_write.recv_timeout(WAIT).unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        cancel.cancel();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .code(),
+            "peer_cancelled"
+        );
+        worker.join().unwrap();
+    });
+    assert_eq!(
+        client.send_test_frame(b"late").unwrap_err().code(),
+        "session_closed"
+    );
+    child.go();
+    child.finish();
+}
+
+#[test]
+fn cancel_one_session_does_not_cancel_another() {
+    let sa = TestPipeServer::bind().unwrap();
+    let sb = TestPipeServer::bind().unwrap();
+    let mut a = ControlledPeer::new(sa.name(), "cancel_late");
+    let mut b = ControlledPeer::new(sb.name(), "cancel_valid");
+    let pa = PinnedProcess::from_child(&a.child.0).unwrap();
+    let pb = PinnedProcess::from_child(&b.child.0).unwrap();
+    let ca = CancelToken::new();
+    let cb = CancelToken::new();
+    let policy = TestPeerPolicy::current().unwrap();
+    let mut a_session = sa.accept_cancellable(&pa, &policy, WAIT, &ca).unwrap();
+    let mut b_session = sb.accept_cancellable(&pb, &policy, WAIT, &cb).unwrap();
+    a_session.issue_challenge(Duration::from_secs(2)).unwrap();
+    b_session.issue_challenge(Duration::from_secs(2)).unwrap();
+    a.step("R3_CANCEL_CHALLENGE");
+    b.step("R3_CANCEL_CHALLENGE");
+    ca.cancel();
+    assert_eq!(
+        a_session.verify_response().unwrap_err().code(),
+        "peer_cancelled"
+    );
+    b.go();
+    let result = b_session.verify_response().unwrap();
+    assert!(
+        result.token_user_matched
+            && result.process_handle_matched
+            && result.creation_time_matched
+            && result.challenge_consumed
+    );
+    assert!(!result.production_service_identity);
+    drop(b_session);
+    b.finish();
+    a.go();
+    a.step("R3_CANCEL_LATE_REJECTED");
+    a.finish();
+    assert_server_token_restored();
+}
+
+#[test]
+fn cancel_authentication_race_has_no_success_after_observed_cancel() {
+    for _ in 0..4 {
+        let server = TestPipeServer::bind().unwrap();
+        let mut child = ControlledPeer::new(server.name(), "cancel_race");
+        let expected = PinnedProcess::from_child(&child.child.0).unwrap();
+        let cancel = CancelToken::new();
+        let mut session = server
+            .accept_cancellable(
+                &expected,
+                &TestPeerPolicy::current().unwrap(),
+                WAIT,
+                &cancel,
+            )
+            .unwrap();
+        session.issue_challenge(Duration::from_secs(2)).unwrap();
+        child.step("R3_CANCEL_CHALLENGE");
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let g = gate.clone();
+        let token = cancel.clone();
+        let stopper = thread::spawn(move || {
+            g.wait();
+            token.cancel();
+        });
+        child.go();
+        gate.wait();
+        let result = session.verify_response();
+        stopper.join().unwrap();
+        match result {
+            Ok(receipt) => {
+                assert!(
+                    receipt.challenge_consumed
+                        && receipt.token_user_matched
+                        && receipt.process_handle_matched
+                );
+                assert!(!receipt.production_service_identity);
+                assert_eq!(
+                    session.verify_response().unwrap_err().code(),
+                    "peer_cancelled"
+                );
+            }
+            Err(error) => assert_eq!(error.code(), "peer_cancelled"),
+        }
+        // The barrier allows either linearized history; once cancellation is
+        // known to precede the next call it can never yield another receipt.
+        assert_eq!(
+            session.verify_response().unwrap_err().code(),
+            "session_closed"
+        );
+        drop(session);
+        child.finish();
+        assert_server_token_restored();
+    }
+}
+
+#[test]
+fn cancel_repeated_requests_and_failures_release_handles() {
+    unsafe {
+        let mut before = 0;
+        assert_ne!(GetProcessHandleCount(GetCurrentProcess(), &mut before), 0);
+        for _ in 0..3 {
+            cancel_connected_hello_read_closes_server_pipe();
+            cancel_partial_frame_read_and_late_bytes_are_rejected();
+            cancel_client_waiting_ack_is_not_authentication_success();
+            let token = CancelToken::new();
+            let threads = (0..8)
+                .map(|_| {
+                    let t = token.clone();
+                    thread::spawn(move || {
+                        t.cancel();
+                        t.cancel();
+                    })
+                })
+                .collect::<Vec<_>>();
+            for t in threads {
+                t.join().unwrap();
+            }
+            let s = TestPipeServer::bind().unwrap();
+            let p = PinnedProcess::current().unwrap();
+            assert_eq!(
+                s.accept_cancellable(&p, &TestPeerPolicy::current().unwrap(), WAIT, &token)
+                    .unwrap_err()
+                    .code(),
+                "peer_cancelled"
+            );
+        }
+        let mut after = 0;
+        assert_ne!(GetProcessHandleCount(GetCurrentProcess(), &mut after), 0);
+        assert!(after <= before + 2, "cancel handle leak: {before}->{after}");
+        assert_server_token_restored();
+    }
+}
+
+#[test]
+fn cancel_pre_cancelled_client_has_no_connect_side_effect() {
+    let token = CancelToken::new();
+    token.cancel();
+    let expected = PinnedProcess::current().unwrap();
+    let name = PipeName::random().unwrap();
+    let start = Instant::now();
+    let result = TestPipeClient::connect_cancellable(
+        &name,
+        &expected,
+        ClientTokenQuality::Impersonation,
+        WAIT,
+        &token,
+    );
+    assert_eq!(result.err().unwrap().code(), "peer_cancelled");
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(TestPipeServer::bind_name(name).is_ok());
+}
+
+#[test]
+fn cancel_before_issue_challenge_closes_authenticated_session() {
+    let server = TestPipeServer::bind().unwrap();
+    let mut child = ControlledPeer::new(server.name(), "cancel_expect_closed");
+    let expected = PinnedProcess::from_child(&child.child.0).unwrap();
+    let cancel = CancelToken::new();
+    let mut session = server
+        .accept_cancellable(
+            &expected,
+            &TestPeerPolicy::current().unwrap(),
+            WAIT,
+            &cancel,
+        )
+        .unwrap();
+    cancel.cancel();
+    assert_eq!(
+        session
+            .issue_challenge(Duration::from_secs(1))
+            .unwrap_err()
+            .code(),
+        "peer_cancelled"
+    );
+    assert_eq!(
+        session.verify_response().unwrap_err().code(),
+        "session_closed"
+    );
+    child.finish();
+    assert_server_token_restored();
+}
+
+#[test]
+fn cancel_after_success_invalidates_session_without_revoking_receipt() {
+    let server = TestPipeServer::bind().unwrap();
+    let mut child = ControlledPeer::new(server.name(), "cancel_valid");
+    let expected = PinnedProcess::from_child(&child.child.0).unwrap();
+    let cancel = CancelToken::new();
+    let mut session = server
+        .accept_cancellable(
+            &expected,
+            &TestPeerPolicy::current().unwrap(),
+            WAIT,
+            &cancel,
+        )
+        .unwrap();
+    session.issue_challenge(Duration::from_secs(2)).unwrap();
+    child.step("R3_CANCEL_CHALLENGE");
+    child.go();
+    let receipt = session.verify_response().unwrap();
+    cancel.cancel();
+    assert!(
+        receipt.token_user_matched
+            && receipt.process_handle_matched
+            && receipt.creation_time_matched
+            && receipt.challenge_consumed
+    );
+    assert!(!receipt.production_service_identity);
+    assert_eq!(
+        session.verify_response().unwrap_err().code(),
+        "peer_cancelled"
+    );
+    assert_eq!(
+        session
+            .issue_challenge(Duration::from_secs(1))
+            .unwrap_err()
+            .code(),
+        "session_closed"
+    );
+    child.finish();
+    assert_server_token_restored();
 }

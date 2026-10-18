@@ -39,6 +39,9 @@ impl CancelToken {
     pub fn cancel(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 #[derive(Clone, Copy, Debug)]
 pub enum SyntheticCase {

@@ -1,5 +1,11 @@
 //! Nonauthoritative test IPC. Supervisor-supplied pins are not service identities.
 //! This module never exposes a Gateway operation or L4 evidence issuance.
+//! Cancellable entries share the caller's R2 token. Observed cancellation closes
+//! the operation's pipe/session before returning; cancelling an idle session is
+//! observed by its next operation (or the owner drops it). No watcher is spawned.
+//! A successful receipt linearizes at its final cancellation check. Cancellation
+//! after that point does not revoke it, and the next operation must still fail.
+use crate::launch::CancelToken;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
@@ -412,10 +418,20 @@ fn remaining(end: Instant) -> Result<u32> {
     Ok(remaining.as_millis().clamp(1, 5000) as u32)
 }
 #[derive(Debug)]
-struct Pipe(Handle);
+struct Pipe {
+    handle: Handle,
+    cancel: Option<CancelToken>,
+}
 impl Pipe {
+    fn check_cancel(&self) -> Result<()> {
+        if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+            return Err(PeerError::new("peer_cancelled"));
+        }
+        Ok(())
+    }
     fn operation(&self, buf: &mut [u8], write: bool, end: Instant) -> Result<usize> {
         loop {
+            self.check_cancel()?;
             remaining(end)?;
             let mut transferred = 0;
             // Both pipe endpoints are synchronous PIPE_NOWAIT byte handles.
@@ -423,7 +439,7 @@ impl Pipe {
             let ok = unsafe {
                 if write {
                     WriteFile(
-                        self.0 .0,
+                        self.handle.0,
                         buf.as_ptr(),
                         buf.len() as u32,
                         &mut transferred,
@@ -431,7 +447,7 @@ impl Pipe {
                     )
                 } else {
                     ReadFile(
-                        self.0 .0,
+                        self.handle.0,
                         buf.as_mut_ptr(),
                         buf.len() as u32,
                         &mut transferred,
@@ -440,6 +456,7 @@ impl Pipe {
                 }
             };
             if ok != 0 && transferred > 0 {
+                self.check_cancel()?;
                 return Ok(transferred as usize);
             }
             if ok == 0 && unsafe { GetLastError() } != ERROR_NO_DATA {
@@ -460,6 +477,7 @@ impl Pipe {
         Ok(())
     }
     fn frame(&self, bytes: &[u8], end: Instant) -> Result<()> {
+        self.check_cancel()?;
         if bytes.is_empty() || bytes.len() > MAX_PEER_MESSAGE {
             return Err(PeerError::new("message_too_large"));
         }
@@ -467,6 +485,7 @@ impl Pipe {
         self.all(&mut bytes.to_vec(), true, end)
     }
     fn read(&self, end: Instant) -> Result<Vec<u8>> {
+        self.check_cancel()?;
         let mut head = [0; 4];
         self.all(&mut head, false, end)?;
         let n = u32::from_le_bytes(head) as usize;
@@ -475,6 +494,7 @@ impl Pipe {
         }
         let mut body = vec![0; n];
         self.all(&mut body, false, end)?;
+        self.check_cancel()?;
         Ok(body)
     }
 }
@@ -485,13 +505,14 @@ fn check_process(
     policy: &TestPeerPolicy,
     client: bool,
 ) -> Result<()> {
+    pipe.check_cancel()?;
     expected.alive()?;
     let mut id = 0;
     let ok = unsafe {
         if client {
-            GetNamedPipeClientProcessId(pipe.0 .0, &mut id)
+            GetNamedPipeClientProcessId(pipe.handle.0, &mut id)
         } else {
-            GetNamedPipeServerProcessId(pipe.0 .0, &mut id)
+            GetNamedPipeServerProcessId(pipe.handle.0, &mut id)
         }
     };
     if ok == 0 {
@@ -504,7 +525,8 @@ fn check_process(
     if observed.token.sid != expected.token.sid || !policy.accepts(&observed.token) {
         return Err(PeerError::new("peer_identity_denied"));
     }
-    expected.alive()
+    expected.alive()?;
+    pipe.check_cancel()
 }
 
 #[derive(Debug)]
@@ -568,7 +590,10 @@ impl TestPipeServer {
                 &attrs,
             )
         };
-        let pipe = Pipe(Handle::checked(h, "pipe_name_unavailable")?);
+        let pipe = Pipe {
+            handle: Handle::checked(h, "pipe_name_unavailable")?,
+            cancel: None,
+        };
         drop(sd_alloc);
         drop(sid_alloc);
         Ok(Self { name, pipe })
@@ -577,7 +602,7 @@ impl TestPipeServer {
         &self.name
     }
     pub fn raw_handle_for_test(&self) -> HANDLE {
-        self.pipe.0 .0
+        self.pipe.handle.0
     }
     pub fn local_only(&self) -> bool {
         true
@@ -591,11 +616,33 @@ impl TestPipeServer {
         policy: &TestPeerPolicy,
         timeout: Duration,
     ) -> Result<PeerSession<'a>> {
+        self.accept_inner(expected, policy, timeout, None)
+    }
+    /// Test-only authentication with the caller's existing R2 cancellation state.
+    /// On observed cancellation this consumes/closes the pipe and returns an error.
+    pub fn accept_cancellable<'a>(
+        self,
+        expected: &'a PinnedProcess,
+        policy: &TestPeerPolicy,
+        timeout: Duration,
+        cancel: &CancelToken,
+    ) -> Result<PeerSession<'a>> {
+        self.accept_inner(expected, policy, timeout, Some(cancel.clone()))
+    }
+    fn accept_inner<'a>(
+        mut self,
+        expected: &'a PinnedProcess,
+        policy: &TestPeerPolicy,
+        timeout: Duration,
+        cancel: Option<CancelToken>,
+    ) -> Result<PeerSession<'a>> {
+        self.pipe.cancel = cancel;
         let end = deadline(timeout)?;
         loop {
+            self.pipe.check_cancel()?;
             expected.alive()?;
             remaining(end)?;
-            let ok = unsafe { ConnectNamedPipe(self.pipe.0 .0, null_mut()) };
+            let ok = unsafe { ConnectNamedPipe(self.pipe.handle.0, null_mut()) };
             if ok == 0 {
                 match unsafe { GetLastError() } {
                     ERROR_PIPE_CONNECTED => break,
@@ -610,11 +657,12 @@ impl TestPipeServer {
         if self.pipe.read(end)? != HELLO {
             return Err(PeerError::new("invalid_message"));
         }
-        let token = impersonated_token(self.pipe.0 .0)?;
+        let token = impersonated_token(self.pipe.handle.0)?;
         if !policy.accepts(&token) || token.sid != expected.token.sid {
             return Err(PeerError::new("peer_identity_denied"));
         }
         check_process(&self.pipe, expected, policy, true)?;
+        self.pipe.check_cancel()?;
         Ok(PeerSession {
             pipe: Some(self.pipe),
             expected,
@@ -662,6 +710,10 @@ pub struct PeerSession<'a> {
 impl PeerSession<'_> {
     pub fn issue_challenge(&mut self, ttl: Duration) -> Result<()> {
         let result = (|| {
+            self.pipe
+                .as_ref()
+                .ok_or_else(|| PeerError::new("session_closed"))?
+                .check_cancel()?;
             if self.challenge.is_some() {
                 return Err(PeerError::new("challenge_already_issued"));
             }
@@ -682,15 +734,21 @@ impl PeerSession<'_> {
                 .ok_or_else(|| PeerError::new("session_closed"))?
                 .frame(&bytes, self.end)?;
             self.challenge = Some((challenge, Instant::now() + ttl));
+            self.pipe.as_ref().unwrap().check_cancel()?;
             Ok(())
         })();
         if result.is_err() {
             self.pipe = None;
+            self.challenge = None;
         }
         result
     }
     pub fn verify_response(&mut self) -> Result<PeerReceipt> {
         let result = (|| {
+            self.pipe
+                .as_ref()
+                .ok_or_else(|| PeerError::new("session_closed"))?
+                .check_cancel()?;
             if self.consumed {
                 return Err(PeerError::new("challenge_consumed"));
             }
@@ -719,13 +777,17 @@ impl PeerSession<'_> {
             if response != *challenge {
                 return Err(PeerError::new("challenge_mismatch"));
             }
-            let token = impersonated_token(pipe.0 .0)?;
+            let token = impersonated_token(pipe.handle.0)?;
             if !self.policy.accepts(&token) || token.sid != self.expected.token.sid {
                 return Err(PeerError::new("peer_identity_denied"));
             }
             check_process(pipe, self.expected, &self.policy, true)?;
             self.consumed = true;
             pipe.frame(ACK, self.end)?;
+            // This final load is the receipt's cancellation linearization point.
+            // A later cancel cannot retroactively revoke a completed receipt;
+            // the next operation still observes it and closes this session.
+            pipe.check_cancel()?;
             Ok(PeerReceipt {
                 token_user_matched: true,
                 process_handle_matched: true,
@@ -750,7 +812,7 @@ pub enum ClientTokenQuality {
     Impersonation,
 }
 pub struct TestPipeClient<'a> {
-    pipe: Pipe,
+    pipe: Option<Pipe>,
     expected: &'a PinnedProcess,
     policy: TestPeerPolicy,
     end: Instant,
@@ -762,7 +824,30 @@ impl<'a> TestPipeClient<'a> {
         quality: ClientTokenQuality,
         timeout: Duration,
     ) -> Result<Self> {
+        Self::connect_inner(name, expected, quality, timeout, None)
+    }
+    /// Uses only the existing token's shared state. Cancellation during connect,
+    /// framed I/O or ACK waits fails closed and releases this client's pipe.
+    pub fn connect_cancellable(
+        name: &PipeName,
+        expected: &'a PinnedProcess,
+        quality: ClientTokenQuality,
+        timeout: Duration,
+        cancel: &CancelToken,
+    ) -> Result<Self> {
+        Self::connect_inner(name, expected, quality, timeout, Some(cancel.clone()))
+    }
+    fn connect_inner(
+        name: &PipeName,
+        expected: &'a PinnedProcess,
+        quality: ClientTokenQuality,
+        timeout: Duration,
+        cancel: Option<CancelToken>,
+    ) -> Result<Self> {
         let end = deadline(timeout)?;
+        if cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+            return Err(PeerError::new("peer_cancelled"));
+        }
         let policy = TestPeerPolicy::current()?;
         let flags = SECURITY_SQOS_PRESENT
             | match quality {
@@ -770,6 +855,9 @@ impl<'a> TestPipeClient<'a> {
                 ClientTokenQuality::Impersonation => SECURITY_IMPERSONATION,
             };
         let pipe = loop {
+            if cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                return Err(PeerError::new("peer_cancelled"));
+            }
             expected.alive()?;
             remaining(end)?;
             let h = unsafe {
@@ -784,7 +872,10 @@ impl<'a> TestPipeClient<'a> {
                 )
             };
             if h != INVALID_HANDLE_VALUE {
-                break Pipe(Handle::checked(h, "pipe_connect_failed")?);
+                break Pipe {
+                    handle: Handle::checked(h, "pipe_connect_failed")?,
+                    cancel,
+                };
             }
             let error = unsafe { GetLastError() };
             if error != ERROR_PIPE_BUSY && error != ERROR_FILE_NOT_FOUND {
@@ -796,47 +887,67 @@ impl<'a> TestPipeClient<'a> {
             thread::sleep(Duration::from_millis(5));
         };
         let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
-        if unsafe { SetNamedPipeHandleState(pipe.0 .0, &mode, null(), null()) } == 0 {
+        if unsafe { SetNamedPipeHandleState(pipe.handle.0, &mode, null(), null()) } == 0 {
             return Err(PeerError::os("pipe_mode_failed"));
         }
         check_process(&pipe, expected, &policy, false)?;
         pipe.frame(HELLO, end)?;
         Ok(Self {
-            pipe,
+            pipe: Some(pipe),
             expected,
             policy,
             end,
         })
     }
-    pub fn challenge(&mut self) -> Result<Challenge> {
-        check_process(&self.pipe, self.expected, &self.policy, false)?;
-        let bytes = self.pipe.read(self.end)?;
-        let c: Challenge =
-            serde_json::from_slice(&bytes).map_err(|_| PeerError::new("invalid_message"))?;
-        if c.version != 1 || c.purpose != PURPOSE {
-            return Err(PeerError::new("invalid_message"));
+    fn with_pipe<T>(&mut self, operation: impl FnOnce(&Self, &Pipe) -> Result<T>) -> Result<T> {
+        let result = (|| {
+            let pipe = self
+                .pipe
+                .as_ref()
+                .ok_or_else(|| PeerError::new("session_closed"))?;
+            pipe.check_cancel()?;
+            let result = operation(self, pipe)?;
+            pipe.check_cancel()?;
+            Ok(result)
+        })();
+        if result.is_err() {
+            self.pipe = None;
         }
-        Ok(c)
+        result
+    }
+    pub fn challenge(&mut self) -> Result<Challenge> {
+        self.with_pipe(|client, pipe| {
+            check_process(pipe, client.expected, &client.policy, false)?;
+            let bytes = pipe.read(client.end)?;
+            let c: Challenge =
+                serde_json::from_slice(&bytes).map_err(|_| PeerError::new("invalid_message"))?;
+            if c.version != 1 || c.purpose != PURPOSE {
+                return Err(PeerError::new("invalid_message"));
+            }
+            Ok(c)
+        })
     }
     pub fn respond(&mut self, c: &Challenge) -> Result<()> {
-        check_process(&self.pipe, self.expected, &self.policy, false)?;
-        self.pipe.frame(
-            &serde_json::to_vec(c).map_err(|_| PeerError::new("invalid_message"))?,
-            self.end,
-        )?;
-        if self.pipe.read(self.end)? != ACK {
-            return Err(PeerError::new("invalid_message"));
-        }
-        check_process(&self.pipe, self.expected, &self.policy, false)
+        self.with_pipe(|client, pipe| {
+            check_process(pipe, client.expected, &client.policy, false)?;
+            pipe.frame(
+                &serde_json::to_vec(c).map_err(|_| PeerError::new("invalid_message"))?,
+                client.end,
+            )?;
+            if pipe.read(client.end)? != ACK {
+                return Err(PeerError::new("invalid_message"));
+            }
+            check_process(pipe, client.expected, &client.policy, false)
+        })
     }
     /// Adversarial synthetic clients only; this endpoint has no service commands.
     pub fn send_test_length(&mut self, len: u32) -> Result<()> {
-        self.pipe.all(&mut len.to_le_bytes(), true, self.end)
+        self.with_pipe(|client, pipe| pipe.all(&mut len.to_le_bytes(), true, client.end))
     }
     pub fn send_test_frame(&mut self, bytes: &[u8]) -> Result<()> {
-        self.pipe.frame(bytes, self.end)
+        self.with_pipe(|client, pipe| pipe.frame(bytes, client.end))
     }
     pub fn wait_for_close(&mut self) -> Result<()> {
-        self.pipe.read(self.end).map(|_| ())
+        self.with_pipe(|client, pipe| pipe.read(client.end).map(|_| ()))
     }
 }

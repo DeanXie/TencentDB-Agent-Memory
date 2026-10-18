@@ -109,6 +109,137 @@ fn ipc_fixture_observation_callback_cannot_bypass_worker_entry_policy() {
     assert_eq!(e.code(), "ipc_worker_required");
     assert!(!invoked);
 }
+
+#[test]
+fn standalone_child_cannot_bypass_r4_worker_entry_policy() {
+    let f = Fixture::new();
+    let mut r = f.request(SyntheticCase::Wait);
+    r.target = LaunchTarget::StandaloneIpc;
+    reject(r, "ipc_worker_required");
+    let mut r = f.request(SyntheticCase::Wait);
+    r.target = LaunchTarget::StandaloneIpc;
+    let mut observed = false;
+    assert_eq!(
+        r.launch_observed_for_test(|_| observed = true)
+            .unwrap_err()
+            .code(),
+        "ipc_worker_required"
+    );
+    assert!(!observed);
+}
+struct FixedChild(std::process::Child);
+impl Drop for FixedChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn fixed_child(args: &[&str]) -> FixedChild {
+    use std::process::Stdio;
+    let artifact = std::path::Path::new(env!("CARGO_BIN_EXE_cmg-runtime-boundary-ipc-child"));
+    assert_eq!(
+        LaunchRequest::standalone_ipc_build_artifact_for_test().unwrap(),
+        artifact
+    );
+    FixedChild(
+        Command::new(artifact)
+            .args(args)
+            .env_clear()
+            .env("SystemRoot", "C:\\Windows")
+            .current_dir(std::env::temp_dir())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    )
+}
+fn finish_fixed_child(mut child: FixedChild, expected: &str) {
+    use std::io::Read;
+    let end = std::time::Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < end,
+            "fixed bin did not exit within its bootstrap bound"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(status.code(), Some(2));
+    let mut stderr = String::new();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .take(2048)
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let mut stdout = String::new();
+    child
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .take(2048)
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert!(
+        stderr.contains(expected),
+        "unexpected fixed-child failure: {stderr}"
+    );
+    assert!(!stdout.contains("running 1 test") && !stdout.contains("R3_CLIENT_AUTHENTICATED"));
+}
+#[test]
+fn standalone_child_is_not_a_libtest_harness_or_command_dispatcher() {
+    for args in [
+        &["--exact", "controlled_ipc_fixture"][..],
+        &["--ignored"][..],
+        &["--nocapture"][..],
+        &["--gateway"][..],
+        &["--command", "cmd.exe"][..],
+    ] {
+        finish_fixed_child(fixed_child(args), "arguments_forbidden");
+    }
+}
+#[test]
+fn standalone_child_missing_bootstrap_exits_without_reader_thread_or_parent_help() {
+    // Keep stdin open. A blocking read_to_end would hang and fail this test.
+    finish_fixed_child(fixed_child(&[]), "ipc_bootstrap_timeout");
+}
+#[test]
+fn standalone_child_eof_invalid_and_oversized_bootstrap_are_rejected() {
+    use std::io::Write;
+    for bytes in [
+        Vec::new(),
+        b"BAD_GO\n{}".to_vec(),
+        b"R2_GO\n{}".to_vec(),
+        vec![b'x'; 2055],
+    ] {
+        let mut child = fixed_child(&[]);
+        let mut input = child.0.stdin.take().unwrap();
+        input.write_all(&bytes).unwrap();
+        drop(input);
+        finish_fixed_child(child, "ipc_gate_invalid");
+    }
+}
+#[test]
+fn standalone_child_does_not_trust_a_self_declared_parent_creation_identity() {
+    use std::io::Write;
+    let parent = windows_runtime_boundary::peer::PinnedProcess::current().unwrap();
+    let name = windows_runtime_boundary::peer::PipeName::random().unwrap();
+    let gate = json!({"parent":parent.id(),"created":parent.creation_time()+1,"pipe":name.as_str(),"case":"Authenticate"});
+    let mut child = fixed_child(&[]);
+    let mut input = child.0.stdin.take().unwrap();
+    input.write_all(b"R2_GO\n").unwrap();
+    input
+        .write_all(&serde_json::to_vec(&gate).unwrap())
+        .unwrap();
+    drop(input);
+    finish_fixed_child(child, "process_identity_mismatch");
+}
 fn receipt(name: &str, r: &windows_runtime_boundary::LaunchReport) {
     println!(
         "R2_PROCESS_RECEIPT={}",

@@ -54,6 +54,8 @@ pub enum LaunchTarget {
     Synthetic(SyntheticCase),
     /// Offline integration-test executable, never a Gateway or arbitrary command.
     SyntheticIpc,
+    /// Fixed ordinary Cargo bin, still offline and nonauthoritative.
+    StandaloneIpc,
     Gateway,
     ProtectedGateway,
 }
@@ -87,6 +89,10 @@ pub enum LaunchEvent {
 }
 #[derive(Debug)]
 pub struct LaunchReport {
+    /// Exact application and serialized command line passed to CreateProcessW.
+    /// These are launch observations, not loaded-code attestation.
+    pub executable_path: PathBuf,
+    pub command_line: String,
     pub startup_confirmed: bool,
     pub output_readers_joined: bool,
     pub job_binding_at_creation: bool,
@@ -115,6 +121,19 @@ pub struct LaunchObservation {
     pub job_handle_not_inherited: bool,
 }
 impl LaunchRequest {
+    /// Locate this package's fixed ordinary development bin beside the current
+    /// Cargo integration-test output. No caller path/hash or environment override
+    /// selects the source. This local build layout is NOT a production trust anchor.
+    pub fn standalone_ipc_build_artifact_for_test() -> Result<PathBuf, LaunchError> {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            windows::standalone_build_artifact()
+        }
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        {
+            Err(error("platform_unavailable"))
+        }
+    }
     pub fn launch_observed_for_test(
         self,
         mut observer: impl FnMut(&LaunchObservation),
@@ -185,6 +204,8 @@ impl StartedChild {
 }
 pub(crate) const IPC_FIXTURE_ENTRY: &str = "app/r3-ipc-test.exe";
 pub(crate) const IPC_FIXTURE_TEST: &str = "controlled_ipc_fixture";
+pub(crate) const STANDALONE_IPC_ENTRY: &str = "app/cmg-runtime-boundary-ipc-child.exe";
+const STANDALONE_IPC_BIN: &str = "cmg-runtime-boundary-ipc-child.exe";
 
 /// Only the R4 offline worker can supply this bounded, internally generated GO
 /// message. It contains no caller-selected command, arguments or environment.
@@ -494,6 +515,7 @@ mod windows {
         Ok(q)
     }
     struct NativeChild {
+        command_line: String,
         process: std::os::windows::io::OwnedHandle,
         thread: Option<std::os::windows::io::OwnedHandle>,
         stdin: Option<fs::File>,
@@ -631,6 +653,7 @@ mod windows {
                 args.extend(quote_arg(argument)?);
             }
             args.push(0);
+            let command_line = String::from_utf16_lossy(&args[..args.len() - 1]);
             let cwd = wide(
                 command
                     .get_current_dir()
@@ -681,6 +704,7 @@ mod windows {
                 return Err(native("spawn_failed"));
             }
             let child = NativeChild {
+                command_line,
                 process: owned(info.hProcess),
                 thread: Some(owned(info.hThread)),
                 stdin: Some(stdin),
@@ -742,15 +766,53 @@ mod windows {
         }
         Ok(())
     }
+    pub(super) fn standalone_build_artifact() -> Result<PathBuf, LaunchError> {
+        let current = std::env::current_exe().map_err(|_| error("ipc_build_source_invalid"))?;
+        let stem = current.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let suffix = stem
+            .strip_prefix("service_contract-")
+            .or_else(|| stem.strip_prefix("launch_contract-"));
+        let deps = current
+            .parent()
+            .ok_or_else(|| error("ipc_build_source_invalid"))?;
+        let profile = deps
+            .parent()
+            .ok_or_else(|| error("ipc_build_source_invalid"))?;
+        if !suffix.is_some_and(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            || deps.file_name() != Some(OsStr::new("deps"))
+            || !matches!(
+                profile.file_name().and_then(|s| s.to_str()),
+                Some("debug" | "release")
+            )
+        {
+            return Err(error("ipc_build_source_invalid"));
+        }
+        validate_root_v2(profile).map_err(|e| error(e.code()))?;
+        let artifact = profile.join(STANDALONE_IPC_BIN);
+        let info = no_reparse(&artifact).map_err(|e| error(e.code()))?;
+        no_extra_streams_v2(&artifact).map_err(|e| error(e.code()))?;
+        if !info.is_file() || info.len() == 0 || info.len() > 256 * 1024 * 1024 {
+            return Err(error("ipc_build_source_invalid"));
+        }
+        Ok(artifact)
+    }
     fn validate(request: &LaunchRequest) -> Result<SyntheticCase, LaunchError> {
-        let ipc = matches!(request.target, LaunchTarget::SyntheticIpc);
+        let standalone = matches!(request.target, LaunchTarget::StandaloneIpc);
+        let ipc = matches!(
+            request.target,
+            LaunchTarget::SyntheticIpc | LaunchTarget::StandaloneIpc
+        );
         let case = match request.target {
             LaunchTarget::Synthetic(c) => c,
-            LaunchTarget::SyntheticIpc => SyntheticCase::Wait,
+            LaunchTarget::SyntheticIpc | LaunchTarget::StandaloneIpc => SyntheticCase::Wait,
             _ => return Err(error("gateway_release_not_qualified")),
         };
         let executable = if ipc {
-            request.release_root.join(IPC_FIXTURE_ENTRY)
+            request.release_root.join(if standalone {
+                STANDALONE_IPC_ENTRY
+            } else {
+                IPC_FIXTURE_ENTRY
+            })
         } else {
             PathBuf::from(NODE_TEST_TOOL)
         };
@@ -785,7 +847,11 @@ mod windows {
             .ok_or_else(|| error("synthetic_fixture_invalid"))?;
         let mut expected = FIXTURE_FILES.to_vec();
         if ipc {
-            expected.push(IPC_FIXTURE_ENTRY);
+            expected.push(if standalone {
+                STANDALONE_IPC_ENTRY
+            } else {
+                IPC_FIXTURE_ENTRY
+            });
             expected.sort_unstable();
         }
         if files.len() != expected.len()
@@ -798,7 +864,14 @@ mod windows {
             &request.release_root.join(SYNTHETIC_ENTRY),
             SYNTHETIC_ENTRY_SOURCE.as_bytes(),
         )?;
-        if ipc {
+        if standalone {
+            // V2 covers the actual copy; compare its bounded raw bytes with the
+            // independently located fixed Cargo bin, never a caller-supplied hash.
+            let source = standalone_build_artifact()?;
+            if hash_tool(&source)? != hash_tool(&executable)? {
+                return Err(error("standalone_ipc_identity_mismatch"));
+            }
+        } else if ipc {
             // This is a closed test-harness entry, not an executable supplied by
             // the caller. The only accepted copy is the current integration-test
             // image, byte-for-byte, in the V2-validated candidate tree. These
@@ -827,10 +900,12 @@ mod windows {
             &request.release_root.join("app/package.json"),
             SYNTHETIC_PACKAGE.as_bytes(),
         )?;
-        validate_root_v2(Path::new(NODE_TEST_TOOL).parent().unwrap())
-            .map_err(|e| error(e.code()))?;
-        no_reparse(Path::new(NODE_TEST_TOOL)).map_err(|e| error(e.code()))?;
-        no_extra_streams_v2(Path::new(NODE_TEST_TOOL)).map_err(|e| error(e.code()))?;
+        if !standalone {
+            validate_root_v2(Path::new(NODE_TEST_TOOL).parent().unwrap())
+                .map_err(|e| error(e.code()))?;
+            no_reparse(Path::new(NODE_TEST_TOOL)).map_err(|e| error(e.code()))?;
+            no_extra_streams_v2(Path::new(NODE_TEST_TOOL)).map_err(|e| error(e.code()))?;
+        }
         if request.cancel.0.load(Ordering::SeqCst) {
             return Err(error("cancelled_before_spawn"));
         }
@@ -859,14 +934,18 @@ mod windows {
             .creation_flags(0x08000000); // CREATE_NO_WINDOW
         c
     }
-    fn ipc_command(root: &Path) -> Command {
+    fn ipc_command(root: &Path, standalone: bool) -> Command {
         let c = command(root, SyntheticCase::Wait);
         // Rebuild instead of appending to the Node argument list.
-        let mut fixed = Command::new(root.join(IPC_FIXTURE_ENTRY));
-        fixed
-            .args(["--exact", IPC_FIXTURE_TEST, "--ignored", "--nocapture"])
-            .current_dir(root.join("work"))
-            .env_clear();
+        let mut fixed = Command::new(root.join(if standalone {
+            STANDALONE_IPC_ENTRY
+        } else {
+            IPC_FIXTURE_ENTRY
+        }));
+        if !standalone {
+            fixed.args(["--exact", IPC_FIXTURE_TEST, "--ignored", "--nocapture"]);
+        }
+        fixed.current_dir(root.join("work")).env_clear();
         for (key, value) in c.get_envs() {
             if let Some(value) = value {
                 fixed.env(key, value);
@@ -1212,7 +1291,10 @@ mod windows {
         mut observer: Option<&mut dyn FnMut(&LaunchObservation)>,
         mut on_ready: Option<&mut dyn FnMut(StartedChild) -> Result<(), LaunchError>>,
     ) -> Result<LaunchReport, LaunchError> {
-        if matches!(request.target, LaunchTarget::SyntheticIpc) {
+        if matches!(
+            request.target,
+            LaunchTarget::SyntheticIpc | LaunchTarget::StandaloneIpc
+        ) {
             return Err(error("ipc_worker_required"));
         }
         launch_core_inner(request, observer.take(), on_ready.take(), None)
@@ -1222,8 +1304,10 @@ mod windows {
         gate: &[u8],
         on_ready: &mut dyn FnMut(StartedChild) -> Result<bool, LaunchError>,
     ) -> Result<LaunchReport, LaunchError> {
-        if !matches!(request.target, LaunchTarget::SyntheticIpc)
-            || gate.len() > 2048
+        if !matches!(
+            request.target,
+            LaunchTarget::SyntheticIpc | LaunchTarget::StandaloneIpc
+        ) || gate.len() > 2048
             || gate.is_empty()
         {
             return Err(error("ipc_fixture_invalid"));
@@ -1253,7 +1337,10 @@ mod windows {
         };
         let start = Instant::now();
         let cmd = if ipc_gate.is_some() {
-            ipc_command(&request.release_root)
+            ipc_command(
+                &request.release_root,
+                matches!(request.target, LaunchTarget::StandaloneIpc),
+            )
         } else {
             command(&request.release_root, case)
         };
@@ -1363,6 +1450,8 @@ mod windows {
         supervised.cleanup();
         let (stdout, stderr) = supervised.join()?;
         Ok(LaunchReport {
+            executable_path: request.executable.clone(),
+            command_line: supervised.running.child.command_line.clone(),
             startup_confirmed,
             output_readers_joined: true,
             job_binding_at_creation: true,

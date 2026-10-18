@@ -500,8 +500,7 @@ struct IpcGate {
 /// Body of the single fixed ignored integration-test entry. No executable,
 /// environment override, command or Gateway mode can be supplied in the gate.
 pub fn controlled_ipc_fixture_entry() -> Result<(), ServiceError> {
-    use crate::peer::{PipeName, TestPipeClient};
-    use std::io::{BufRead, Read, Write};
+    use std::io::{BufRead, Read};
     let mut input = std::io::BufReader::new(std::io::stdin().take(2055));
     let mut go = String::new();
     input
@@ -517,16 +516,87 @@ pub fn controlled_ipc_fixture_entry() -> Result<(), ServiceError> {
     if bytes.len() > 2048 {
         return Err(ServiceError::new("ipc_gate_invalid"));
     }
+    run_fixed_ipc_client(&bytes)
+}
+
+/// Ordinary Cargo bin entry. Reuses the existing R3 client; no libtest dispatch,
+/// alternate command, runtime configuration or service mode is available.
+pub fn standalone_ipc_child_entry() -> Result<(), ServiceError> {
+    use std::io::Read;
+    use windows_sys::Win32::{
+        Storage::FileSystem::{GetFileType, FILE_TYPE_PIPE},
+        System::Pipes::PeekNamedPipe,
+    };
+    if std::env::args_os().len() != 1 {
+        return Err(ServiceError::new("ipc_arguments_forbidden"));
+    }
+    let mut input = std::io::stdin();
+    let raw = input.as_raw_handle();
+    if unsafe { GetFileType(raw) } != FILE_TYPE_PIPE {
+        return Err(ServiceError::new("ipc_bootstrap_pipe_required"));
+    }
+    // The fixed parent writes <=2054 bytes then closes its anonymous pipe.
+    // Peek before each read avoids a blocking stdin reader or detached thread.
+    // Until identity is parsed, EOF/this deadline bounds even an absent parent.
+    let end = Instant::now() + Duration::from_millis(1500);
+    let mut bytes = Vec::new();
+    loop {
+        if Instant::now() >= end {
+            return Err(ServiceError::new("ipc_bootstrap_timeout"));
+        }
+        let mut available = 0;
+        if unsafe { PeekNamedPipe(raw, null_mut(), 0, null_mut(), &mut available, null_mut()) } == 0
+        {
+            if unsafe { GetLastError() } == ERROR_BROKEN_PIPE {
+                break;
+            }
+            return Err(ServiceError::native("ipc_bootstrap_read_failed"));
+        }
+        if available == 0 {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        let mut buffer = [0u8; 2055];
+        let count = (available as usize).min(buffer.len());
+        let n = input
+            .read(&mut buffer[..count])
+            .map_err(|_| ServiceError::new("ipc_bootstrap_read_failed"))?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..n]);
+        if bytes.len() > 2054 {
+            return Err(ServiceError::new("ipc_gate_invalid"));
+        }
+    }
+    let gate = bytes
+        .strip_prefix(b"R2_GO\n")
+        .ok_or_else(|| ServiceError::new("ipc_gate_invalid"))?;
+    run_fixed_ipc_client(gate)
+}
+
+fn fixed_client_wait(parent: &PinnedProcess) -> Result<(), ServiceError> {
+    let end = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < end {
+        if !parent.is_alive().map_err(peer_failure)? {
+            return Err(ServiceError::new("ipc_parent_exited"));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+fn run_fixed_ipc_client(bytes: &[u8]) -> Result<(), ServiceError> {
+    use crate::peer::{PipeName, TestPipeClient};
+    use std::io::Write;
     let gate: IpcGate =
-        serde_json::from_slice(&bytes).map_err(|_| ServiceError::new("ipc_gate_invalid"))?;
+        serde_json::from_slice(bytes).map_err(|_| ServiceError::new("ipc_gate_invalid"))?;
     let parent = PinnedProcess::open_test_peer(gate.parent, gate.created).map_err(peer_failure)?;
     let name = PipeName::parse_local(&gate.pipe).map_err(peer_failure)?;
     if gate.case == SyntheticIpcCase::EarlyExit {
         return Ok(());
     }
     if gate.case == SyntheticIpcCase::ConnectWait {
-        thread::sleep(Duration::from_secs(4));
-        return Ok(());
+        return fixed_client_wait(&parent);
     }
     let mut client = TestPipeClient::connect(
         &name,
@@ -538,8 +608,7 @@ pub fn controlled_ipc_fixture_entry() -> Result<(), ServiceError> {
     let challenge = client.challenge().map_err(peer_failure)?;
     if gate.case == SyntheticIpcCase::ChallengeWait {
         let _ = client.wait_for_close();
-        thread::sleep(Duration::from_secs(4));
-        return Ok(());
+        return fixed_client_wait(&parent);
     }
     if gate.case == SyntheticIpcCase::LateResponse {
         thread::sleep(Duration::from_millis(150));
@@ -556,8 +625,7 @@ pub fn controlled_ipc_fixture_entry() -> Result<(), ServiceError> {
     let _ = client.wait_for_close();
     // Keep the same authenticated process alive for R2's owned Job termination.
     // This bounded test wait cannot spawn a descendant or reopen a session.
-    thread::sleep(Duration::from_secs(4));
-    Ok(())
+    fixed_client_wait(&parent)
 }
 
 fn ipc_exchange(
@@ -1141,7 +1209,10 @@ pub fn run_synthetic_ipc_lifecycle(
     control: SyntheticProcessControl,
     case: SyntheticIpcCase,
 ) -> Result<SyntheticProcessReport, ServiceError> {
-    if !matches!(request.target, launch::LaunchTarget::SyntheticIpc) {
+    if !matches!(
+        request.target,
+        launch::LaunchTarget::SyntheticIpc | launch::LaunchTarget::StandaloneIpc
+    ) {
         return Err(ServiceError::new("ipc_fixture_required"));
     }
     control

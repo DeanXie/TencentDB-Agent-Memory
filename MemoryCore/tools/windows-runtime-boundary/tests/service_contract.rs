@@ -384,6 +384,7 @@ fn hash(bytes: &[u8]) -> String {
 struct ProcessFixture {
     root: PathBuf,
     manifest: Value,
+    preserve: bool,
 }
 impl ProcessFixture {
     fn new() -> Self {
@@ -419,7 +420,11 @@ impl ProcessFixture {
             fs::create_dir(root.join(name)).unwrap();
         }
         let manifest = json!({"format_version":2,"platform":"windows","architecture":"x86_64","validation_scope":"candidate-static-tree","production_eligible":false,"entry":SYNTHETIC_ENTRY,"node":node,"node_identity_scope":"reported-target-not-packaged","build_tool":build,"closure":{"path":"closure-report.json","sha256":hash(&report),"graph_path":"js-dependency-graph.json","graph_sha256":hash(&graph),"unresolved_edges":1},"runtime":{"dependency_closure_proven":false,"native_load_verified":false,"config_isolation":false,"protected_service":false,"trusted_issuer":false},"directories":["app","app/src","app/src/gateway","temp","work"],"files":files});
-        Self { root, manifest }
+        Self {
+            root,
+            manifest,
+            preserve: false,
+        }
     }
     fn request(&self, case: SyntheticCase) -> LaunchRequest {
         LaunchRequest {
@@ -439,7 +444,9 @@ impl ProcessFixture {
 impl Drop for ProcessFixture {
     fn drop(&mut self) {
         assert!(self.root.starts_with(std::env::temp_dir()));
-        fs::remove_dir_all(&self.root).unwrap();
+        if !self.preserve {
+            fs::remove_dir_all(&self.root).unwrap();
+        }
     }
 }
 
@@ -515,6 +522,213 @@ fn ipc_chain_request(f: &ProcessFixture) -> LaunchRequest {
     request.timeout = Duration::from_secs(5);
     request
 }
+
+fn standalone_chain_request(f: &ProcessFixture) -> LaunchRequest {
+    let mut request = f.request(SyntheticCase::Wait);
+    let source = PathBuf::from(env!("CARGO_BIN_EXE_cmg-runtime-boundary-ipc-child"));
+    assert_eq!(
+        LaunchRequest::standalone_ipc_build_artifact_for_test().unwrap(),
+        source
+    );
+    let bytes = fs::read(source).unwrap();
+    let path = "app/cmg-runtime-boundary-ipc-child.exe";
+    request.target = LaunchTarget::StandaloneIpc;
+    request.executable = f.root.join(path);
+    request.timeout = Duration::from_secs(5);
+    fs::write(&request.executable, &bytes).unwrap();
+    let mut manifest: Value = serde_json::from_slice(&request.manifest).unwrap();
+    manifest["files"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"path":path,"size":bytes.len(),"sha256":hash(&bytes),"kind":"resource"}));
+    manifest["files"]
+        .as_array_mut()
+        .unwrap()
+        .sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    request.manifest = serde_json::to_vec(&manifest).unwrap();
+    request
+}
+#[test]
+fn standalone_child_runs_existing_real_lifecycle() {
+    let mut f = ProcessFixture::new();
+    let control = SyntheticProcessControl::new();
+    let mut sink = process_sink(&control);
+    let request = standalone_chain_request(&f);
+    let manifest = request.manifest.clone();
+    let result =
+        run_synthetic_ipc_lifecycle(&mut sink, request, control, SyntheticIpcCase::Authenticate)
+            .expect("ordinary Cargo child must be accepted by the fixed offline artifact policy");
+    let ipc = result.ipc.unwrap();
+    let launch = result.launch.unwrap();
+    assert_eq!(
+        launch.executable_path,
+        f.root.join("app/cmg-runtime-boundary-ipc-child.exe")
+    );
+    assert_eq!(
+        launch.command_line,
+        format!("\"{}\"", launch.executable_path.display())
+    );
+    assert!(!launch.stdout.contains("running 1 test"));
+    assert_eq!(
+        launch.test_tool_sha256,
+        hash(&fs::read(env!("CARGO_BIN_EXE_cmg-runtime-boundary-ipc-child")).unwrap())
+    );
+    assert!(ipc.authenticated && ipc.process_identity_matched && launch.startup_confirmed);
+    assert!(
+        launch.job_binding_at_creation
+            && launch.job_membership_verified
+            && launch.job_handle_not_inherited
+    );
+    assert!(launch.process_reaped && launch.job_closed && launch.output_readers_joined);
+    assert!(result.lifecycle.worker_joined && result.lifecycle.resources_released);
+    assert_eq!(
+        sink.states
+            .iter()
+            .filter(|s| s.phase == ServicePhase::Running)
+            .count(),
+        1
+    );
+    assert_eq!(sink.stopped_calls, 1);
+    windows_runtime_boundary::validate_release_v2(&f.root, &manifest).unwrap();
+    let manifest_path = f.root.with_extension("manifest.json");
+    fs::write(&manifest_path, manifest).unwrap();
+    f.preserve = true; // Retain this fresh candidate only, for the requested delivery.
+    println!(
+        "STANDALONE_CHILD_RECEIPT={}",
+        json!({"source":env!("CARGO_BIN_EXE_cmg-runtime-boundary-ipc-child"),"copy":launch.executable_path,"manifest":manifest_path,"sha256":launch.test_tool_sha256,"command_line":launch.command_line,"libtest":false,"job_binding_at_creation":launch.job_binding_at_creation,"process_identity_matched":ipc.process_identity_matched,"authenticated":ipc.authenticated,"process_reaped":launch.process_reaped,"job_closed":launch.job_closed,"readers_joined":launch.output_readers_joined,"worker_joined":result.lifecycle.worker_joined,"production_eligible":false})
+    );
+}
+
+#[test]
+fn standalone_child_stop_during_actual_pipe_connection_wait() {
+    assert_ipc_cancelled_mode(SyntheticIpcCase::ConnectWait, 1, false, true);
+}
+#[test]
+fn standalone_child_stop_during_challenge_wait() {
+    assert_ipc_cancelled_mode(SyntheticIpcCase::ChallengeWait, 2, true, true);
+}
+#[test]
+fn standalone_child_late_response_cannot_publish_running_after_stop() {
+    assert_ipc_cancelled_mode(SyntheticIpcCase::LateResponse, 2, false, true);
+}
+#[test]
+fn standalone_child_early_exit_fails_closed() {
+    let f = ProcessFixture::new();
+    let c = SyntheticProcessControl::new();
+    let mut sink = ProcessSink::default();
+    let e = run_synthetic_ipc_lifecycle(
+        &mut sink,
+        standalone_chain_request(&f),
+        c,
+        SyntheticIpcCase::EarlyExit,
+    )
+    .unwrap_err();
+    assert!(matches!(e.code(), "peer_exited" | "startup_child_exited"));
+    assert!(!sink.states.iter().any(|s| s.phase == ServicePhase::Running));
+    assert_eq!(sink.stopped_calls, 1);
+}
+#[test]
+fn standalone_child_rejects_changed_bytes_even_if_manifest_is_rehashed() {
+    for rehash in [false, true] {
+        let f = ProcessFixture::new();
+        let c = SyntheticProcessControl::new();
+        let mut r = standalone_chain_request(&f);
+        let mut bytes = fs::read(&r.executable).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&r.executable, &bytes).unwrap();
+        if rehash {
+            let mut m: Value = serde_json::from_slice(&r.manifest).unwrap();
+            m["files"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|e| e["path"] == "app/cmg-runtime-boundary-ipc-child.exe")
+                .unwrap()["sha256"] = json!(hash(&bytes));
+            r.manifest = serde_json::to_vec(&m).unwrap();
+        }
+        let mut sink = ProcessSink::default();
+        let e =
+            run_synthetic_ipc_lifecycle(&mut sink, r, c.clone(), SyntheticIpcCase::Authenticate)
+                .unwrap_err();
+        assert_eq!(
+            e.code(),
+            if rehash {
+                "standalone_ipc_identity_mismatch"
+            } else {
+                "file_identity_mismatch"
+            }
+        );
+        assert_eq!(c.ipc_stage(), 0);
+        assert_eq!(sink.stopped_calls, 1);
+    }
+}
+#[test]
+fn standalone_child_rejects_libtest_image_in_its_candidate_slot() {
+    let f = ProcessFixture::new();
+    let c = SyntheticProcessControl::new();
+    let mut r = standalone_chain_request(&f);
+    let bytes = fs::read(std::env::current_exe().unwrap()).unwrap();
+    fs::write(&r.executable, &bytes).unwrap();
+    let mut m: Value = serde_json::from_slice(&r.manifest).unwrap();
+    let e = m["files"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["path"] == "app/cmg-runtime-boundary-ipc-child.exe")
+        .unwrap();
+    e["size"] = json!(bytes.len());
+    e["sha256"] = json!(hash(&bytes));
+    r.manifest = serde_json::to_vec(&m).unwrap();
+    let mut sink = ProcessSink::default();
+    let e = run_synthetic_ipc_lifecycle(&mut sink, r, c.clone(), SyntheticIpcCase::Authenticate)
+        .unwrap_err();
+    assert_eq!(e.code(), "standalone_ipc_identity_mismatch");
+    assert_eq!(c.ipc_stage(), 0);
+}
+#[test]
+fn standalone_child_rejects_argument_environment_executable_and_directory_overrides() {
+    for change in 0..4 {
+        let f = ProcessFixture::new();
+        let c = SyntheticProcessControl::new();
+        let mut r = standalone_chain_request(&f);
+        match change {
+            0 => r.arguments.push("--ignored".into()),
+            1 => r
+                .environment_overrides
+                .push(("R3_PIPE".into(), "attacker".into())),
+            2 => r.executable = PathBuf::from(env!("CARGO_BIN_EXE_cmg-runtime-boundary-ipc-child")),
+            _ => r.working_directory = f.root.clone(),
+        }
+        let mut sink = ProcessSink::default();
+        let e =
+            run_synthetic_ipc_lifecycle(&mut sink, r, c.clone(), SyntheticIpcCase::Authenticate)
+                .unwrap_err();
+        assert_eq!(e.code(), "launch_policy_rejected");
+        assert_eq!(c.ipc_stage(), 0);
+    }
+}
+#[test]
+fn standalone_child_does_not_unlock_gateway_or_old_synthetic_fixture_policy() {
+    for target in [
+        LaunchTarget::SyntheticIpc,
+        LaunchTarget::Gateway,
+        LaunchTarget::ProtectedGateway,
+    ] {
+        let f = ProcessFixture::new();
+        let c = SyntheticProcessControl::new();
+        let mut r = standalone_chain_request(&f);
+        r.target = target;
+        let mut sink = ProcessSink::default();
+        assert!(run_synthetic_ipc_lifecycle(
+            &mut sink,
+            r,
+            c.clone(),
+            SyntheticIpcCase::Authenticate
+        )
+        .is_err());
+        assert_eq!(c.ipc_stage(), 0);
+    }
+}
 fn run_ipc_chain(
     sink: &mut impl StatusSink,
     request: LaunchRequest,
@@ -582,13 +796,25 @@ fn stop_in_ipc_stage(
     })
 }
 fn assert_ipc_cancelled(case: SyntheticIpcCase, stage: u32, concurrent: bool) {
+    assert_ipc_cancelled_mode(case, stage, concurrent, false);
+}
+fn assert_ipc_cancelled_mode(
+    case: SyntheticIpcCase,
+    stage: u32,
+    concurrent: bool,
+    standalone: bool,
+) {
     let f = ProcessFixture::new();
     let control = SyntheticProcessControl::new();
     let stopper = stop_in_ipc_stage(control.clone(), stage, concurrent);
     let mut sink = ProcessSink::default();
     let start = Instant::now();
-    let result =
-        run_synthetic_ipc_lifecycle(&mut sink, ipc_chain_request(&f), control.clone(), case);
+    let request = if standalone {
+        standalone_chain_request(&f)
+    } else {
+        ipc_chain_request(&f)
+    };
+    let result = run_synthetic_ipc_lifecycle(&mut sink, request, control.clone(), case);
     // Always join the bounded scheduler, including assertion/error paths.
     stopper.join().unwrap();
     let result = result.unwrap();

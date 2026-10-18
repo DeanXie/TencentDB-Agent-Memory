@@ -13,3 +13,8 @@ windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Stor
 [[bin]]
 name = "cmg-runtime-boundary-test-service"
 path = "src/main.rs"
+
+[[bin]]
+name = "cmg-runtime-boundary-ipc-child"
+path = "src/bin/cmg-runtime-boundary-ipc-child.rs"
+test = false

@@ -1,6 +1,7 @@
 //! R4A test-only SCM host. No service installation, Gateway, issuer or verifier.
 //! Offline sinks exercise lifecycle logic; they do not prove actual SCM behavior.
 use crate::launch::{self, CancelToken, LaunchOutcome, LaunchReport, LaunchRequest, StartedChild};
+use crate::peer::{PeerError, PinnedProcess, TestPeerPolicy, TestPipeServer};
 use std::{
     cell::Cell,
     ffi::OsString,
@@ -238,6 +239,7 @@ struct Control {
     fault: AtomicU32,
     event: Mutex<Option<Arc<Event>>>,
     process_cancel: Mutex<Option<CancelToken>>,
+    ipc_stage: AtomicU32,
     #[cfg(test)]
     before_ready: Mutex<Option<Arc<r4b_tests::Checkpoint>>>,
     #[cfg(test)]
@@ -255,6 +257,7 @@ impl Control {
             fault: AtomicU32::new(0),
             event: Mutex::new(None),
             process_cancel: Mutex::new(None),
+            ipc_stage: AtomicU32::new(0),
             #[cfg(test)]
             before_ready: Mutex::new(None),
             #[cfg(test)]
@@ -428,6 +431,10 @@ impl Default for SyntheticProcessControl {
     }
 }
 impl SyntheticProcessControl {
+    /// Offline scheduling observation only; never authority or an IPC receipt.
+    pub fn ipc_stage(&self) -> u32 {
+        self.inner.ipc_stage.load(Ordering::SeqCst)
+    }
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Control::new()),
@@ -453,6 +460,168 @@ impl SyntheticProcessControl {
 struct ProcessState {
     started: Option<StartedChild>,
     report: Option<LaunchReport>,
+    ipc_case: Option<SyntheticIpcCase>,
+    ipc: Option<SyntheticIpcReport>,
+}
+/// Fixed client behaviours for the closed offline integration-test executable.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum SyntheticIpcCase {
+    Authenticate,
+    ConnectWait,
+    ChallengeWait,
+    LateResponse,
+    EarlyExit,
+    Replay,
+    WrongIdentity,
+}
+#[derive(Debug, Default)]
+pub struct SyntheticIpcReport {
+    pub authenticated: bool,
+    pub process_identity_matched: bool,
+    pub cancellation_observed: bool,
+    pub pipe_released_before_job: bool,
+    pub replay_rejected: bool,
+}
+fn peer_failure(e: PeerError) -> ServiceError {
+    ServiceError {
+        code: e.code(),
+        native_code: e.native_code,
+    }
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IpcGate {
+    pipe: String,
+    parent: u32,
+    created: u64,
+    case: SyntheticIpcCase,
+}
+
+/// Body of the single fixed ignored integration-test entry. No executable,
+/// environment override, command or Gateway mode can be supplied in the gate.
+pub fn controlled_ipc_fixture_entry() -> Result<(), ServiceError> {
+    use crate::peer::{PipeName, TestPipeClient};
+    use std::io::{BufRead, Read, Write};
+    let mut input = std::io::BufReader::new(std::io::stdin().take(2055));
+    let mut go = String::new();
+    input
+        .read_line(&mut go)
+        .map_err(|_| ServiceError::new("ipc_gate_invalid"))?;
+    if go != "R2_GO\n" {
+        return Err(ServiceError::new("ipc_gate_invalid"));
+    }
+    let mut bytes = Vec::new();
+    input
+        .read_to_end(&mut bytes)
+        .map_err(|_| ServiceError::new("ipc_gate_invalid"))?;
+    if bytes.len() > 2048 {
+        return Err(ServiceError::new("ipc_gate_invalid"));
+    }
+    let gate: IpcGate =
+        serde_json::from_slice(&bytes).map_err(|_| ServiceError::new("ipc_gate_invalid"))?;
+    let parent = PinnedProcess::open_test_peer(gate.parent, gate.created).map_err(peer_failure)?;
+    let name = PipeName::parse_local(&gate.pipe).map_err(peer_failure)?;
+    if gate.case == SyntheticIpcCase::EarlyExit {
+        return Ok(());
+    }
+    if gate.case == SyntheticIpcCase::ConnectWait {
+        thread::sleep(Duration::from_secs(4));
+        return Ok(());
+    }
+    let mut client = TestPipeClient::connect(
+        &name,
+        &parent,
+        crate::peer::ClientTokenQuality::Impersonation,
+        Duration::from_secs(3),
+    )
+    .map_err(peer_failure)?;
+    let challenge = client.challenge().map_err(peer_failure)?;
+    if gate.case == SyntheticIpcCase::ChallengeWait {
+        let _ = client.wait_for_close();
+        thread::sleep(Duration::from_secs(4));
+        return Ok(());
+    }
+    if gate.case == SyntheticIpcCase::LateResponse {
+        thread::sleep(Duration::from_millis(150));
+    }
+    println!("R3_CLIENT_AUTHENTICATED");
+    std::io::stdout()
+        .flush()
+        .map_err(|_| ServiceError::new("ipc_output_failed"))?;
+    // respond verifies the fixed-purpose, session-bound challenge and ACK.
+    // The marker alone is never used to accept a server-side receipt.
+    if client.respond(&challenge).is_err() {
+        return Ok(());
+    }
+    let _ = client.wait_for_close();
+    // Keep the same authenticated process alive for R2's owned Job termination.
+    // This bounded test wait cannot spawn a descendant or reopen a session.
+    thread::sleep(Duration::from_secs(4));
+    Ok(())
+}
+
+fn ipc_exchange(
+    server: TestPipeServer,
+    started: &StartedChild,
+    case: SyntheticIpcCase,
+    cancel: &CancelToken,
+    control: &Control,
+    state: &Mutex<ProcessState>,
+) -> Result<bool, ServiceError> {
+    let expected = PinnedProcess::from_controlled_child(started).map_err(peer_failure)?;
+    let wrong;
+    let pin = if case == SyntheticIpcCase::WrongIdentity {
+        wrong = PinnedProcess::current().map_err(peer_failure)?;
+        &wrong
+    } else {
+        &expected
+    };
+    let policy = TestPeerPolicy::current().map_err(peer_failure)?;
+    control.ipc_stage.store(1, Ordering::SeqCst);
+    let result = (|| {
+        let mut session =
+            server.accept_cancellable(pin, &policy, Duration::from_secs(3), cancel)?;
+        session.issue_challenge(Duration::from_secs(2))?;
+        control.ipc_stage.store(2, Ordering::SeqCst);
+        if case == SyntheticIpcCase::LateResponse {
+            // Deterministic offline schedule: do not consume a response until
+            // STOP's shared token is set (or this bounded checkpoint expires).
+            // Thus a delayed/pending client echo cannot win merely because the
+            // test controller was descheduled; R3 still decides cancellation.
+            let end = Instant::now() + Duration::from_millis(1500);
+            while !cancel.is_cancelled() && Instant::now() < end {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let receipt = session.verify_response()?;
+        // R3's final token load remains the success linearization point. STOP
+        // after that point does not retroactively revoke a completed receipt.
+        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+        let trace = s.ipc.as_mut().unwrap();
+        trace.authenticated = true;
+        trace.process_identity_matched = receipt.token_user_matched
+            && receipt.process_handle_matched
+            && receipt.creation_time_matched
+            && receipt.challenge_consumed
+            && !receipt.production_service_identity;
+        if case == SyntheticIpcCase::Replay {
+            trace.replay_rejected = session
+                .verify_response()
+                .is_err_and(|e| e.code() == "challenge_consumed");
+        }
+        control.ipc_stage.store(3, Ordering::SeqCst);
+        Ok::<_, PeerError>(true)
+    })(); // session, pipe, challenge and pinned duplicates drop before Job cleanup.
+    let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+    s.ipc.as_mut().unwrap().pipe_released_before_job = true;
+    match result {
+        Ok(value) => Ok(value),
+        Err(e) if e.code() == "peer_cancelled" && control.stop.load(Ordering::SeqCst) => {
+            s.ipc.as_mut().unwrap().cancellation_observed = true;
+            Ok(false)
+        }
+        Err(e) => Err(peer_failure(e)),
+    }
 }
 fn launch_failure(error: launch::LaunchError) -> ServiceError {
     ServiceError {
@@ -538,11 +707,59 @@ impl Worker {
         let thread = thread::Builder::new()
             .name("offline-synthetic-process".into())
             .spawn(move || {
-                let mut on_ready = |started| {
+                let ipc_case = thread_state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .ipc_case;
+                let ipc_setup = if let Some(case) = ipc_case {
+                    (|| {
+                        let server = TestPipeServer::bind().map_err(peer_failure)?;
+                        let parent = PinnedProcess::current().map_err(peer_failure)?;
+                        let gate = serde_json::to_vec(&IpcGate {
+                            pipe: server.name().as_str().into(),
+                            parent: parent.id(),
+                            created: parent.creation_time(),
+                            case,
+                        })
+                        .map_err(|_| ServiceError::new("ipc_gate_invalid"))?;
+                        Ok::<_, ServiceError>((Some(server), gate))
+                    })()
+                } else {
+                    Ok((None, Vec::new()))
+                };
+                let mut ipc_failure = None;
+                let (mut server, gate) = match ipc_setup {
+                    Ok(setup) => setup,
+                    Err(e) => {
+                        *thread_startup.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(Err(e.clone()));
+                        thread_ready.set()?;
+                        return Err(e);
+                    }
+                };
+                let mut on_ready = |started: StartedChild| {
                     if thread_control.stop.load(Ordering::SeqCst) {
                         return Err(launch::error("startup_cancelled"));
                     }
                     let accepted = (|| {
+                        if let Some(case) = ipc_case {
+                            match ipc_exchange(
+                                server.take().unwrap(),
+                                &started,
+                                case,
+                                &cancel,
+                                &thread_control,
+                                &thread_state,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => return Ok(()),
+                                Err(e) => {
+                                    ipc_failure = Some(e);
+                                    cancel.cancel();
+                                    return Ok(());
+                                }
+                            }
+                        }
                         thread_state
                             .lock()
                             .map_err(|_| ServiceError::new("worker_lock_poisoned"))?
@@ -566,7 +783,18 @@ impl Worker {
                     Ok(())
                 };
                 #[cfg(test)]
-                let result = {
+                let result = if ipc_case.is_some() {
+                    launch::launch_with_ipc(request, &gate, &mut |child| {
+                        on_ready(child)?;
+                        Ok(thread_state
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .ipc
+                            .as_ref()
+                            .unwrap()
+                            .authenticated)
+                    })
+                } else {
                     let point = thread_control.before_go.lock().unwrap().clone();
                     if let Some(point) = point {
                         launch::launch_with_startup_observed(request, &mut on_ready, &mut |_| {
@@ -577,7 +805,20 @@ impl Worker {
                     }
                 };
                 #[cfg(not(test))]
-                let result = launch::launch_with_startup(request, &mut on_ready);
+                let result = if ipc_case.is_some() {
+                    launch::launch_with_ipc(request, &gate, &mut |child| {
+                        on_ready(child)?;
+                        Ok(thread_state
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .ipc
+                            .as_ref()
+                            .unwrap()
+                            .authenticated)
+                    })
+                } else {
+                    launch::launch_with_startup(request, &mut on_ready)
+                };
                 let completion = match result {
                     Ok(report) => {
                         let stopped = thread_control.stop.load(Ordering::SeqCst);
@@ -604,6 +845,11 @@ impl Worker {
                         Ok(())
                     }
                     Err(error) => Err(launch_failure(error)),
+                };
+                let completion = if let Some(error) = ipc_failure {
+                    Err(error)
+                } else {
+                    completion
                 };
                 let mut status = thread_startup
                     .lock()
@@ -722,6 +968,7 @@ pub struct SyntheticServiceReport {
 pub struct SyntheticProcessReport {
     pub lifecycle: SyntheticServiceReport,
     pub launch: Option<LaunchReport>,
+    pub ipc: Option<SyntheticIpcReport>,
 }
 fn run_engine(
     sink: &mut impl StatusSink,
@@ -877,12 +1124,44 @@ pub fn run_synthetic_process_lifecycle(
     let state = Arc::new(Mutex::new(ProcessState::default()));
     let lifecycle =
         run_engine_with_process(sink, control.inner, None, Some((request, state.clone())))?;
-    let launch = state
+    let mut state = state
         .lock()
-        .map_err(|_| ServiceError::new("worker_lock_poisoned"))?
-        .report
-        .take();
-    Ok(SyntheticProcessReport { lifecycle, launch })
+        .map_err(|_| ServiceError::new("worker_lock_poisoned"))?;
+    Ok(SyntheticProcessReport {
+        lifecycle,
+        launch: state.report.take(),
+        ipc: state.ipc.take(),
+    })
+}
+/// Real R2 Job-bound test executable + R3 native authentication, under the same
+/// R4 STOP token. Not used by SCM, Gateway or any production qualification.
+pub fn run_synthetic_ipc_lifecycle(
+    sink: &mut impl StatusSink,
+    request: LaunchRequest,
+    control: SyntheticProcessControl,
+    case: SyntheticIpcCase,
+) -> Result<SyntheticProcessReport, ServiceError> {
+    if !matches!(request.target, launch::LaunchTarget::SyntheticIpc) {
+        return Err(ServiceError::new("ipc_fixture_required"));
+    }
+    control
+        .inner
+        .install_process_cancel(request.cancel.clone())?;
+    let state = Arc::new(Mutex::new(ProcessState {
+        ipc_case: Some(case),
+        ipc: Some(SyntheticIpcReport::default()),
+        ..Default::default()
+    }));
+    let lifecycle =
+        run_engine_with_process(sink, control.inner, None, Some((request, state.clone())))?;
+    let mut s = state
+        .lock()
+        .map_err(|_| ServiceError::new("worker_lock_poisoned"))?;
+    Ok(SyntheticProcessReport {
+        lifecycle,
+        launch: s.report.take(),
+        ipc: s.ipc.take(),
+    })
 }
 struct NativeSink(SERVICE_STATUS_HANDLE);
 impl StatusSink for NativeSink {

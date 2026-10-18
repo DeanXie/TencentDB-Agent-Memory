@@ -5,6 +5,9 @@
 //! observed by its next operation (or the owner drops it). No watcher is spawned.
 //! A successful receipt linearizes at its final cancellation check. Cancellation
 //! after that point does not revoke it, and the next operation must still fail.
+//! A client observing ACK is not a server receipt: cancellation can win the
+//! server's final check after ACK delivery. Only the returned server receipt
+//! establishes completion under this offline protocol's cancellation contract.
 use crate::launch::CancelToken;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -260,6 +263,11 @@ impl fmt::Debug for PinnedProcess {
     }
 }
 impl PinnedProcess {
+    /// Only R2's retained original process object can enter this adapter. No
+    /// caller-supplied PID/SID or authentication result is accepted.
+    pub(crate) fn from_controlled_child(child: &crate::launch::StartedChild) -> Result<Self> {
+        Self::from_handle(duplicate(child.process_handle().as_raw_handle())?)
+    }
     fn from_handle(handle: Handle) -> Result<Self> {
         let id = unsafe { GetProcessId(handle.0) };
         if id == 0 {

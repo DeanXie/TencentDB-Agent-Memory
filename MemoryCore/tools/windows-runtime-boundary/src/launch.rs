@@ -52,6 +52,8 @@ pub enum SyntheticCase {
 #[derive(Clone, Copy, Debug)]
 pub enum LaunchTarget {
     Synthetic(SyntheticCase),
+    /// Offline integration-test executable, never a Gateway or arbitrary command.
+    SyntheticIpc,
     Gateway,
     ProtectedGateway,
 }
@@ -158,6 +160,11 @@ pub(crate) struct StartedChild {
     process: std::os::windows::io::OwnedHandle,
 }
 impl StartedChild {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn process_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        use std::os::windows::io::AsHandle;
+        self.process.as_handle()
+    }
     pub(crate) fn is_alive(&self) -> Result<bool, LaunchError> {
         #[cfg(all(windows, target_arch = "x86_64"))]
         {
@@ -173,6 +180,26 @@ impl StartedChild {
             }
         }
         #[cfg(not(all(windows, target_arch = "x86_64")))]
+        Err(error("platform_unavailable"))
+    }
+}
+pub(crate) const IPC_FIXTURE_ENTRY: &str = "app/r3-ipc-test.exe";
+pub(crate) const IPC_FIXTURE_TEST: &str = "controlled_ipc_fixture";
+
+/// Only the R4 offline worker can supply this bounded, internally generated GO
+/// message. It contains no caller-selected command, arguments or environment.
+pub(crate) fn launch_with_ipc(
+    request: LaunchRequest,
+    gate: &[u8],
+    on_ready: &mut dyn FnMut(StartedChild) -> Result<bool, LaunchError>,
+) -> Result<LaunchReport, LaunchError> {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        windows::launch_ipc(request, gate, on_ready)
+    }
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    {
+        let _ = (request, gate, on_ready);
         Err(error("platform_unavailable"))
     }
 }
@@ -716,11 +743,19 @@ mod windows {
         Ok(())
     }
     fn validate(request: &LaunchRequest) -> Result<SyntheticCase, LaunchError> {
+        let ipc = matches!(request.target, LaunchTarget::SyntheticIpc);
         let case = match request.target {
             LaunchTarget::Synthetic(c) => c,
+            LaunchTarget::SyntheticIpc => SyntheticCase::Wait,
             _ => return Err(error("gateway_release_not_qualified")),
         };
-        if request.executable.as_os_str() != OsStr::new(NODE_TEST_TOOL)
+        let executable = if ipc {
+            request.release_root.join(IPC_FIXTURE_ENTRY)
+        } else {
+            PathBuf::from(NODE_TEST_TOOL)
+        };
+        if request.executable != executable
+            || (ipc && request.timeout != Duration::from_secs(5))
             || request.entry != SYNTHETIC_ENTRY
             || !request.arguments.is_empty()
             || !request.environment_overrides.is_empty()
@@ -748,8 +783,13 @@ mod windows {
         let files = m["files"]
             .as_array()
             .ok_or_else(|| error("synthetic_fixture_invalid"))?;
-        if files.len() != FIXTURE_FILES.len()
-            || files.iter().zip(FIXTURE_FILES).any(|(x, p)| x["path"] != p)
+        let mut expected = FIXTURE_FILES.to_vec();
+        if ipc {
+            expected.push(IPC_FIXTURE_ENTRY);
+            expected.sort_unstable();
+        }
+        if files.len() != expected.len()
+            || files.iter().zip(expected).any(|(x, p)| x["path"] != p)
             || m["directories"] != serde_json::json!(FIXTURE_DIRS)
         {
             return Err(error("synthetic_fixture_invalid"));
@@ -758,6 +798,31 @@ mod windows {
             &request.release_root.join(SYNTHETIC_ENTRY),
             SYNTHETIC_ENTRY_SOURCE.as_bytes(),
         )?;
+        if ipc {
+            // This is a closed test-harness entry, not an executable supplied by
+            // the caller. The only accepted copy is the current integration-test
+            // image, byte-for-byte, in the V2-validated candidate tree. These
+            // unprotected test bytes do not constitute runtime code attestation.
+            let current = std::env::current_exe().map_err(|_| error("ipc_fixture_invalid"))?;
+            let stem = current.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let suffix = stem
+                .strip_prefix("service_contract-")
+                .or_else(|| stem.strip_prefix("launch_contract-"));
+            if !suffix.is_some_and(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())) {
+                return Err(error("ipc_fixture_invalid"));
+            }
+            validate_root_v2(
+                current
+                    .parent()
+                    .ok_or_else(|| error("ipc_fixture_invalid"))?,
+            )
+            .map_err(|e| error(e.code()))?;
+            no_reparse(&current).map_err(|e| error(e.code()))?;
+            no_extra_streams_v2(&current).map_err(|e| error(e.code()))?;
+            if hash_tool(&current)? != hash_tool(&executable)? {
+                return Err(error("ipc_fixture_identity_mismatch"));
+            }
+        }
         exact_file(
             &request.release_root.join("app/package.json"),
             SYNTHETIC_PACKAGE.as_bytes(),
@@ -793,6 +858,26 @@ mod windows {
             .stderr(Stdio::piped())
             .creation_flags(0x08000000); // CREATE_NO_WINDOW
         c
+    }
+    fn ipc_command(root: &Path) -> Command {
+        let c = command(root, SyntheticCase::Wait);
+        // Rebuild instead of appending to the Node argument list.
+        let mut fixed = Command::new(root.join(IPC_FIXTURE_ENTRY));
+        fixed
+            .args(["--exact", IPC_FIXTURE_TEST, "--ignored", "--nocapture"])
+            .current_dir(root.join("work"))
+            .env_clear();
+        for (key, value) in c.get_envs() {
+            if let Some(value) = value {
+                fixed.env(key, value);
+            }
+        }
+        fixed
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(0x08000000);
+        fixed
     }
     fn output(reader: Option<impl Read>) -> Result<String, LaunchError> {
         let mut bytes = Vec::new();
@@ -1028,7 +1113,10 @@ mod windows {
         }
     }
     fn tool_hash() -> Result<String, LaunchError> {
-        let file = fs::File::open(NODE_TEST_TOOL).map_err(|_| error("test_tool_unavailable"))?;
+        hash_tool(Path::new(NODE_TEST_TOOL))
+    }
+    fn hash_tool(path: &Path) -> Result<String, LaunchError> {
+        let file = fs::File::open(path).map_err(|_| error("test_tool_unavailable"))?;
         let mut reader = file.take(256 * 1024 * 1024 + 1);
         let mut hash = Sha256::new();
         let mut bytes = [0u8; 65536];
@@ -1124,10 +1212,52 @@ mod windows {
         mut observer: Option<&mut dyn FnMut(&LaunchObservation)>,
         mut on_ready: Option<&mut dyn FnMut(StartedChild) -> Result<(), LaunchError>>,
     ) -> Result<LaunchReport, LaunchError> {
+        if matches!(request.target, LaunchTarget::SyntheticIpc) {
+            return Err(error("ipc_worker_required"));
+        }
+        launch_core_inner(request, observer.take(), on_ready.take(), None)
+    }
+    pub(super) fn launch_ipc(
+        request: LaunchRequest,
+        gate: &[u8],
+        on_ready: &mut dyn FnMut(StartedChild) -> Result<bool, LaunchError>,
+    ) -> Result<LaunchReport, LaunchError> {
+        if !matches!(request.target, LaunchTarget::SyntheticIpc)
+            || gate.len() > 2048
+            || gate.is_empty()
+        {
+            return Err(error("ipc_fixture_invalid"));
+        }
+        let mut authenticated = false;
+        let mut callback = |child| {
+            authenticated = on_ready(child)?;
+            Ok(())
+        };
+        let mut report = launch_core_inner(request, None, Some(&mut callback), Some(gate))?;
+        // A cleanup report after pre-auth cancellation is not a startup receipt.
+        // The boolean is internal and derived by R4 only from the real R3 receipt.
+        report.startup_confirmed = authenticated;
+        Ok(report)
+    }
+    fn launch_core_inner(
+        request: LaunchRequest,
+        mut observer: Option<&mut dyn FnMut(&LaunchObservation)>,
+        mut on_ready: Option<&mut dyn FnMut(StartedChild) -> Result<(), LaunchError>>,
+        ipc_gate: Option<&[u8]>,
+    ) -> Result<LaunchReport, LaunchError> {
         let case = validate(&request)?;
-        let test_tool_sha256 = tool_hash()?;
+        let test_tool_sha256 = if ipc_gate.is_some() {
+            hash_tool(&request.executable)?
+        } else {
+            tool_hash()?
+        };
         let start = Instant::now();
-        let mut running = Running::start_suspended(command(&request.release_root, case))?;
+        let cmd = if ipc_gate.is_some() {
+            ipc_command(&request.release_root)
+        } else {
+            command(&request.release_root, case)
+        };
+        let mut running = Running::start_suspended(cmd)?;
         if let Some(callback) = observer.as_mut() {
             callback(&running.child.observation()?);
         }
@@ -1157,18 +1287,29 @@ mod windows {
             });
             outcome
         } else {
-            supervised
+            let mut stdin = supervised
                 .running
                 .child
                 .stdin
                 .take()
-                .ok_or_else(|| error("stdin_unavailable"))?
+                .ok_or_else(|| error("stdin_unavailable"))?;
+            stdin
                 .write_all(b"R2_GO\n")
                 .map_err(|_| error("handshake_failed"))?;
+            if let Some(gate) = ipc_gate {
+                stdin
+                    .write_all(gate)
+                    .map_err(|_| error("handshake_failed"))?;
+            }
+            drop(stdin);
             events.push(LaunchEvent::HandshakeSent);
-            if let Some(outcome) =
+            let startup = if ipc_gate.is_some() {
+                // R3 authentication, not libtest/stdout text, gates readiness.
+                None
+            } else {
                 await_startup(&mut supervised, &request, case, start, on_ready.is_some())?
-            {
+            };
+            if let Some(outcome) = startup {
                 events.push(if outcome == LaunchOutcome::Aborted {
                     LaunchEvent::Aborted
                 } else {

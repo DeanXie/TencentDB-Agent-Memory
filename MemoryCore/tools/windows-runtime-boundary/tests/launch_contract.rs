@@ -91,6 +91,24 @@ impl Drop for Fixture {
 fn reject(r: LaunchRequest, code: &str) {
     assert_eq!(launch_synthetic(r).unwrap_err().code(), code);
 }
+
+#[test]
+fn ipc_fixture_cannot_be_launched_without_the_r4_ipc_worker() {
+    let f = Fixture::new();
+    let mut r = f.request(SyntheticCase::Wait);
+    r.target = LaunchTarget::SyntheticIpc;
+    reject(r, "ipc_worker_required");
+}
+#[test]
+fn ipc_fixture_observation_callback_cannot_bypass_worker_entry_policy() {
+    let f = Fixture::new();
+    let mut r = f.request(SyntheticCase::Wait);
+    r.target = LaunchTarget::SyntheticIpc;
+    let mut invoked = false;
+    let e = r.launch_observed_for_test(|_| invoked = true).unwrap_err();
+    assert_eq!(e.code(), "ipc_worker_required");
+    assert!(!invoked);
+}
 fn receipt(name: &str, r: &windows_runtime_boundary::LaunchReport) {
     println!(
         "R2_PROCESS_RECEIPT={}",

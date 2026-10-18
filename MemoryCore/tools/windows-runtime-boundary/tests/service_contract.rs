@@ -494,6 +494,462 @@ fn process_sink(control: &SyntheticProcessControl) -> ProcessSink {
     sink.stop_at = Some(ServicePhase::Running);
     sink
 }
+
+fn ipc_chain_request(f: &ProcessFixture) -> LaunchRequest {
+    let bytes = fs::read(std::env::current_exe().unwrap()).unwrap();
+    let path = "app/r3-ipc-test.exe";
+    fs::write(f.root.join(path), &bytes).unwrap();
+    let mut manifest = f.manifest.clone();
+    manifest["files"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"path":path,"size":bytes.len(),"sha256":hash(&bytes),"kind":"resource"}));
+    manifest["files"]
+        .as_array_mut()
+        .unwrap()
+        .sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    let mut request = f.request(SyntheticCase::Wait);
+    request.target = LaunchTarget::SyntheticIpc;
+    request.executable = f.root.join(path);
+    request.manifest = serde_json::to_vec(&manifest).unwrap();
+    request.timeout = Duration::from_secs(5);
+    request
+}
+fn run_ipc_chain(
+    sink: &mut impl StatusSink,
+    request: LaunchRequest,
+    control: SyntheticProcessControl,
+) -> Result<SyntheticProcessReport, ServiceError> {
+    let result =
+        run_synthetic_ipc_lifecycle(sink, request, control, SyntheticIpcCase::Authenticate)?;
+    let trace = result.ipc.as_ref().unwrap();
+    assert!(
+        trace.authenticated && trace.process_identity_matched && trace.pipe_released_before_job
+    );
+    Ok(result)
+}
+
+#[test]
+#[ignore = "fixed Job-bound offline IPC entry; invoked only by R2 closed policy"]
+fn controlled_ipc_fixture() {
+    controlled_ipc_fixture_entry().unwrap();
+}
+
+#[test]
+fn ipc_chain_real_authenticated_child_then_r4_stop_reaps_job_and_readers() {
+    let f = ProcessFixture::new();
+    let control = SyntheticProcessControl::new();
+    let mut sink = process_sink(&control);
+    let result = run_ipc_chain(&mut sink, ipc_chain_request(&f), control).unwrap();
+    let launch = result.launch.unwrap();
+    assert!(
+        launch.stdout.contains("R3_CLIENT_AUTHENTICATED"),
+        "the existing R4 worker has no real R3 authenticated session: {}",
+        launch.stdout
+    );
+    assert!(launch.job_membership_verified && launch.job_binding_at_creation);
+    assert!(launch.process_reaped && launch.job_closed && launch.output_readers_joined);
+    assert!(result.lifecycle.worker_joined && result.lifecycle.resources_released);
+    assert_eq!(sink.stopped_calls, 1);
+}
+
+fn stop_in_ipc_stage(
+    control: SyntheticProcessControl,
+    stage: u32,
+    concurrent: bool,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let end = Instant::now() + Duration::from_secs(4);
+        while control.ipc_stage() < stage {
+            assert!(Instant::now() < end, "IPC stage {stage} was never reached");
+            thread::sleep(Duration::from_millis(2));
+        }
+        if concurrent {
+            let mut stops = vec![];
+            for _ in 0..8 {
+                let c = control.clone();
+                stops.push(thread::spawn(move || {
+                    c.stop().unwrap();
+                    c.stop().unwrap();
+                }));
+            }
+            for stop in stops {
+                stop.join().unwrap();
+            }
+        } else {
+            control.stop().unwrap();
+        }
+    })
+}
+fn assert_ipc_cancelled(case: SyntheticIpcCase, stage: u32, concurrent: bool) {
+    let f = ProcessFixture::new();
+    let control = SyntheticProcessControl::new();
+    let stopper = stop_in_ipc_stage(control.clone(), stage, concurrent);
+    let mut sink = ProcessSink::default();
+    let start = Instant::now();
+    let result =
+        run_synthetic_ipc_lifecycle(&mut sink, ipc_chain_request(&f), control.clone(), case);
+    // Always join the bounded scheduler, including assertion/error paths.
+    stopper.join().unwrap();
+    let result = result.unwrap();
+    assert!(start.elapsed() < Duration::from_secs(4));
+    let trace = result.ipc.unwrap();
+    assert!(trace.cancellation_observed && !trace.authenticated);
+    assert!(trace.pipe_released_before_job);
+    let launch = result.launch.unwrap();
+    assert!(!launch.startup_confirmed);
+    assert_eq!(
+        launch.outcome,
+        windows_runtime_boundary::LaunchOutcome::Aborted
+    );
+    assert!(launch.job_membership_verified && launch.job_binding_at_creation);
+    assert!(launch.process_reaped && launch.job_closed && launch.output_readers_joined);
+    assert!(result.lifecycle.worker_joined && result.lifecycle.resources_released);
+    assert!(!result.lifecycle.prepared_before_running);
+    assert!(!sink.states.iter().any(|s| s.phase == ServicePhase::Running));
+    assert_eq!(sink.stopped_calls, 1);
+    control.stop().unwrap();
+    println!("R4_R3_CHAIN=STOP->shared_token->peer_cancelled->pipe_drop->Job_close->child_reaped->readers_joined->worker_joined->STOPPED;case={case:?}");
+}
+#[test]
+fn ipc_chain_stop_cancels_actual_connection_wait() {
+    assert_ipc_cancelled(SyntheticIpcCase::ConnectWait, 1, false);
+}
+#[test]
+fn ipc_chain_stop_cancels_actual_challenge_response_wait() {
+    assert_ipc_cancelled(SyntheticIpcCase::ChallengeWait, 2, false);
+}
+#[test]
+fn ipc_chain_concurrent_repeated_stop_is_idempotent() {
+    assert_ipc_cancelled(SyntheticIpcCase::ChallengeWait, 2, true);
+}
+#[test]
+fn ipc_chain_stop_wins_over_late_authentication_response() {
+    assert_ipc_cancelled(SyntheticIpcCase::LateResponse, 2, false);
+}
+#[test]
+fn ipc_chain_completed_authentication_receipt_is_not_retroactively_revoked() {
+    let f = ProcessFixture::new();
+    let control = SyntheticProcessControl::new();
+    let mut sink = process_sink(&control);
+    let r = run_synthetic_ipc_lifecycle(
+        &mut sink,
+        ipc_chain_request(&f),
+        control,
+        SyntheticIpcCase::Authenticate,
+    )
+    .unwrap();
+    let trace = r.ipc.unwrap();
+    assert!(trace.authenticated && trace.process_identity_matched && !trace.cancellation_observed);
+    assert!(r.launch.unwrap().startup_confirmed);
+    assert_eq!(
+        sink.states
+            .iter()
+            .filter(|s| s.phase == ServicePhase::Running)
+            .count(),
+        1
+    );
+    assert_eq!(sink.stopped_calls, 1);
+}
+#[test]
+fn ipc_chain_replay_still_rejected_after_real_authentication() {
+    let f = ProcessFixture::new();
+    let control = SyntheticProcessControl::new();
+    let mut sink = process_sink(&control);
+    let r = run_synthetic_ipc_lifecycle(
+        &mut sink,
+        ipc_chain_request(&f),
+        control,
+        SyntheticIpcCase::Replay,
+    )
+    .unwrap();
+    let trace = r.ipc.unwrap();
+    assert!(trace.authenticated && trace.process_identity_matched && trace.replay_rejected);
+    assert!(r.launch.unwrap().process_reaped);
+}
+#[test]
+fn ipc_chain_wrong_real_process_identity_fails_closed() {
+    let f = ProcessFixture::new();
+    let control = SyntheticProcessControl::new();
+    let mut sink = ProcessSink::default();
+    let error = run_synthetic_ipc_lifecycle(
+        &mut sink,
+        ipc_chain_request(&f),
+        control,
+        SyntheticIpcCase::WrongIdentity,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), "process_identity_mismatch");
+    assert!(!sink.states.iter().any(|s| s.phase == ServicePhase::Running));
+    assert_eq!(sink.stopped_calls, 1);
+}
+#[test]
+fn ipc_chain_early_child_exit_is_not_ready_or_authenticated() {
+    let f = ProcessFixture::new();
+    let control = SyntheticProcessControl::new();
+    let mut sink = ProcessSink::default();
+    let error = run_synthetic_ipc_lifecycle(
+        &mut sink,
+        ipc_chain_request(&f),
+        control,
+        SyntheticIpcCase::EarlyExit,
+    )
+    .unwrap_err();
+    // Exit can precede either R2's original-object liveness probe or R3's
+    // accept-loop liveness probe. Both reject before any RUNNING publication.
+    assert!(
+        matches!(error.code(), "peer_exited" | "startup_child_exited"),
+        "unexpected error: {error:?}"
+    );
+    assert!(!sink.states.iter().any(|s| s.phase == ServicePhase::Running));
+    assert_eq!(sink.stopped_calls, 1);
+}
+#[test]
+fn ipc_chain_status_failure_cancels_worker_and_closes_every_resource() {
+    let f = ProcessFixture::new();
+    let control = SyntheticProcessControl::new();
+    let mut sink = process_sink(&control);
+    sink.fail_at = Some(ServicePhase::Running);
+    let error = run_synthetic_ipc_lifecycle(
+        &mut sink,
+        ipc_chain_request(&f),
+        control.clone(),
+        SyntheticIpcCase::Authenticate,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), "synthetic_status_failure");
+    assert_eq!(sink.stopped_calls, 1);
+    control.stop().unwrap();
+}
+#[test]
+fn ipc_chain_cancel_one_session_does_not_cancel_another() {
+    let other = thread::spawn(|| {
+        let f = ProcessFixture::new();
+        let c = SyntheticProcessControl::new();
+        let mut sink = process_sink(&c);
+        let result = run_synthetic_ipc_lifecycle(
+            &mut sink,
+            ipc_chain_request(&f),
+            c,
+            SyntheticIpcCase::Authenticate,
+        )
+        .unwrap();
+        assert!(result.ipc.unwrap().authenticated);
+        assert_eq!(sink.stopped_calls, 1);
+    });
+    assert_ipc_cancelled(SyntheticIpcCase::ChallengeWait, 2, false);
+    other.join().unwrap();
+}
+#[test]
+fn ipc_chain_preaccepted_stop_never_spawns_or_publishes_running() {
+    let f = ProcessFixture::new();
+    let c = SyntheticProcessControl::new();
+    c.stop().unwrap();
+    let mut sink = ProcessSink::default();
+    let r = run_synthetic_ipc_lifecycle(
+        &mut sink,
+        ipc_chain_request(&f),
+        c,
+        SyntheticIpcCase::Authenticate,
+    )
+    .unwrap();
+    assert!(r.launch.is_none());
+    assert!(!r.ipc.unwrap().authenticated);
+    assert_eq!(sink.stopped_calls, 1);
+    assert!(!sink.states.iter().any(|s| s.phase == ServicePhase::Running));
+}
+#[test]
+fn ipc_chain_bad_manifest_is_rejected_before_any_ipc_accept() {
+    let f = ProcessFixture::new();
+    let c = SyntheticProcessControl::new();
+    let mut r = ipc_chain_request(&f);
+    r.manifest = b"{}".to_vec();
+    let mut sink = ProcessSink::default();
+    assert!(
+        run_synthetic_ipc_lifecycle(&mut sink, r, c.clone(), SyntheticIpcCase::Authenticate)
+            .is_err()
+    );
+    assert_eq!(c.ipc_stage(), 0);
+    assert_eq!(sink.stopped_calls, 1);
+}
+
+#[test]
+fn ipc_chain_rejects_foreign_executable_even_with_matching_v2_file_digest() {
+    let f = ProcessFixture::new();
+    let c = SyntheticProcessControl::new();
+    let mut r = ipc_chain_request(&f);
+    let bytes = fs::read(NODE_TEST_TOOL).unwrap();
+    fs::write(&r.executable, &bytes).unwrap();
+    let mut m: Value = serde_json::from_slice(&r.manifest).unwrap();
+    let item = m["files"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["path"] == "app/r3-ipc-test.exe")
+        .unwrap();
+    item["size"] = json!(bytes.len());
+    item["sha256"] = json!(hash(&bytes));
+    r.manifest = serde_json::to_vec(&m).unwrap();
+    let mut sink = ProcessSink::default();
+    let e = run_synthetic_ipc_lifecycle(&mut sink, r, c.clone(), SyntheticIpcCase::Authenticate)
+        .unwrap_err();
+    assert_eq!(e.code(), "ipc_fixture_identity_mismatch");
+    assert_eq!(c.ipc_stage(), 0);
+    assert_eq!(sink.stopped_calls, 1);
+}
+#[test]
+fn ipc_chain_rejects_tampered_fixture_without_manifest_update() {
+    let f = ProcessFixture::new();
+    let c = SyntheticProcessControl::new();
+    let r = ipc_chain_request(&f);
+    let mut bytes = fs::read(&r.executable).unwrap();
+    bytes[0] ^= 1;
+    fs::write(&r.executable, bytes).unwrap();
+    let mut sink = ProcessSink::default();
+    let e = run_synthetic_ipc_lifecycle(&mut sink, r, c.clone(), SyntheticIpcCase::Authenticate)
+        .unwrap_err();
+    assert_eq!(e.code(), "file_identity_mismatch");
+    assert_eq!(c.ipc_stage(), 0);
+}
+#[test]
+fn ipc_chain_rejects_executable_arguments_environment_and_workdir_overrides() {
+    for change in 0..4 {
+        let f = ProcessFixture::new();
+        let c = SyntheticProcessControl::new();
+        let mut r = ipc_chain_request(&f);
+        match change {
+            0 => r.executable = PathBuf::from(NODE_TEST_TOOL),
+            1 => r.arguments.push("--list".into()),
+            2 => r
+                .environment_overrides
+                .push(("RUST_TEST_THREADS".into(), "100".into())),
+            _ => r.working_directory = f.root.clone(),
+        }
+        let mut sink = ProcessSink::default();
+        let e =
+            run_synthetic_ipc_lifecycle(&mut sink, r, c.clone(), SyntheticIpcCase::Authenticate)
+                .unwrap_err();
+        assert_eq!(e.code(), "launch_policy_rejected");
+        assert_eq!(c.ipc_stage(), 0);
+        assert_eq!(sink.stopped_calls, 1);
+    }
+}
+#[test]
+fn ipc_chain_does_not_accept_existing_wait_or_gateway_targets() {
+    for target in [
+        LaunchTarget::Synthetic(SyntheticCase::Wait),
+        LaunchTarget::Gateway,
+        LaunchTarget::ProtectedGateway,
+    ] {
+        let f = ProcessFixture::new();
+        let c = SyntheticProcessControl::new();
+        let mut r = f.request(SyntheticCase::Wait);
+        r.target = target;
+        let mut sink = ProcessSink::default();
+        let e = run_synthetic_ipc_lifecycle(&mut sink, r, c, SyntheticIpcCase::Authenticate)
+            .unwrap_err();
+        assert_eq!(e.code(), "ipc_fixture_required");
+        assert!(sink.states.is_empty());
+    }
+}
+#[test]
+fn ipc_chain_bounded_accept_timeout_is_not_a_successful_stop() {
+    let f = ProcessFixture::new();
+    let c = SyntheticProcessControl::new();
+    let mut sink = ProcessSink::default();
+    let e = run_synthetic_ipc_lifecycle(
+        &mut sink,
+        ipc_chain_request(&f),
+        c,
+        SyntheticIpcCase::ConnectWait,
+    )
+    .unwrap_err();
+    assert_eq!(e.code(), "timeout");
+    assert_eq!(sink.stopped_calls, 1);
+    assert!(!sink.states.iter().any(|s| s.phase == ServicePhase::Running));
+}
+
+#[test]
+fn ipc_chain_stop_and_authentication_race_has_one_server_receipt_outcome() {
+    for _ in 0..4 {
+        let f = ProcessFixture::new();
+        let c = SyntheticProcessControl::new();
+        let stopper = stop_in_ipc_stage(c.clone(), 2, true);
+        let mut sink = ProcessSink::default();
+        let result = run_synthetic_ipc_lifecycle(
+            &mut sink,
+            ipc_chain_request(&f),
+            c,
+            SyntheticIpcCase::Authenticate,
+        );
+        stopper.join().unwrap();
+        let r = result.unwrap();
+        let trace = r.ipc.unwrap();
+        let launch = r.launch.unwrap();
+        // ACK observation/child stdout is deliberately not the authority here.
+        // R3's existing final token check decides the server receipt exactly once.
+        if trace.authenticated {
+            assert!(
+                trace.process_identity_matched
+                    && launch.startup_confirmed
+                    && !trace.cancellation_observed
+            );
+        } else {
+            assert!(trace.cancellation_observed && !launch.startup_confirmed);
+        }
+        assert!(launch.process_reaped && launch.job_closed && launch.output_readers_joined);
+        assert!(r.lifecycle.worker_joined && r.lifecycle.resources_released);
+        assert_eq!(sink.stopped_calls, 1);
+        assert!(
+            sink.states
+                .iter()
+                .filter(|s| s.phase == ServicePhase::Running)
+                .count()
+                <= 1
+        );
+        let terminal = sink
+            .states
+            .iter()
+            .position(|s| s.phase == ServicePhase::StopPending)
+            .unwrap();
+        assert!(!sink.states[terminal..]
+            .iter()
+            .any(|s| s.phase == ServicePhase::Running));
+    }
+}
+fn current_handle_count() -> u32 {
+    let mut count = 0;
+    assert_ne!(
+        unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) },
+        0
+    );
+    count
+}
+#[test]
+fn ipc_chain_failure_and_cancellation_paths_release_process_and_pipe_handles() {
+    // Warm up the test runner/crypto/thread machinery before taking the baseline.
+    assert_ipc_cancelled(SyntheticIpcCase::ChallengeWait, 2, false);
+    let before = current_handle_count();
+    for _ in 0..3 {
+        assert_ipc_cancelled(SyntheticIpcCase::ChallengeWait, 2, false);
+        let f = ProcessFixture::new();
+        let c = SyntheticProcessControl::new();
+        let mut sink = ProcessSink::default();
+        assert!(run_synthetic_ipc_lifecycle(
+            &mut sink,
+            ipc_chain_request(&f),
+            c,
+            SyntheticIpcCase::WrongIdentity
+        )
+        .is_err());
+        assert_eq!(sink.stopped_calls, 1);
+    }
+    assert_eq!(
+        current_handle_count(),
+        before,
+        "owned Pipe, Job, child, event and thread handles must be released"
+    );
+}
 #[test]
 fn process_worker_valid_ack_then_stop_reaps_and_joins_readers() {
     let f = ProcessFixture::new();

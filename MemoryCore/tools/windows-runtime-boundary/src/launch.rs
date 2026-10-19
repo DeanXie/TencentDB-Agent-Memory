@@ -932,8 +932,36 @@ mod windows {
     }
     // Conservative Windows ACL policy. Unsupported ACEs fail closed; no AccessCheck
     // shortcut or owner-name inference. Denies never justify an untrusted write grant.
-    fn protected_acl(path: &Path, allow_servicing_owner: bool) -> Result<(), LaunchError> {
+    #[derive(Clone, Copy)]
+    enum AclScope {
+        ProtectedObject,
+        ExistingAncestor,
+    }
+    fn acl_scope(path: &Path, child: Option<&Path>) -> Result<AclScope, LaunchError> {
+        let Some(child) = child else {
+            return Ok(AclScope::ProtectedObject);
+        };
+        // The exception is only for an already-existing, selected child directory.
+        // Creating a different sibling cannot replace it. Missing children, aliases
+        // and reparse traversal must not obtain this weaker ancestor-only policy.
+        if child.parent() != Some(path) {
+            return Err(error("scm_path_rejected"));
+        }
+        validate_root_v2(child).map_err(|e| error(e.code()))?;
+        for p in [path, child] {
+            if !no_reparse(p).map_err(|e| error(e.code()))?.is_dir() {
+                return Err(error("scm_path_rejected"));
+            }
+        }
+        Ok(AclScope::ExistingAncestor)
+    }
+    fn protected_acl(
+        path: &Path,
+        allow_servicing_owner: bool,
+        child: Option<&Path>,
+    ) -> Result<(), LaunchError> {
         use windows_sys::Win32::Security::{Authorization::*, *};
+        let scope = acl_scope(path, child)?;
         struct Local(*mut std::ffi::c_void);
         impl Drop for Local {
             fn drop(&mut self) {
@@ -964,12 +992,13 @@ mod windows {
                 os_error: Some(code as i32),
             });
         }
-        protected_acl_descriptor(owner, acl, allow_servicing_owner)
+        protected_acl_descriptor(owner, acl, allow_servicing_owner, scope)
     }
     fn protected_acl_descriptor(
         owner: windows_sys::Win32::Security::PSID,
         acl: *mut windows_sys::Win32::Security::ACL,
         allow_servicing_owner: bool,
+        scope: AclScope,
     ) -> Result<(), LaunchError> {
         use windows_sys::Win32::Security::{Authorization::*, *};
         struct Local(*mut std::ffi::c_void);
@@ -1009,7 +1038,15 @@ mod windows {
         if !trusted(&sid_text(owner)?) || acl.is_null() || unsafe { IsValidAcl(acl) } == 0 {
             return Err(error("scm_acl_rejected"));
         }
-        let write_mask = 0x500d0156u32;
+        let strict_write_mask = 0x500d0156u32;
+        // FILE_ADD_SUBDIRECTORY cannot replace the checked existing child. Keep
+        // DELETE_CHILD, DELETE, WRITE_DAC/OWNER and all other write grants blocked.
+        // The version root and every deployed object always use the strict mask,
+        // including effective inherited grants. This remains a point-in-time check.
+        let write_mask = match scope {
+            AclScope::ProtectedObject => strict_write_mask,
+            AclScope::ExistingAncestor => strict_write_mask & !0x4,
+        };
         for i in 0..unsafe { (*acl).AceCount } {
             let mut raw = std::ptr::null_mut();
             if unsafe { GetAce(acl, i as u32, &mut raw) } == 0 || raw.is_null() {
@@ -1043,12 +1080,15 @@ mod windows {
             return Err(error("scm_path_rejected"));
         }
         validate_root_v2(version).map_err(|e| error(e.code()))?;
+        let mut child = None;
         for p in version.ancestors() {
             no_reparse(p).map_err(|e| error(e.code()))?;
             protected_acl(
                 p,
                 p == Path::new(r"C:\") || p == Path::new(r"C:\Program Files"),
+                child,
             )?;
+            child = Some(p);
         }
         fn walk(path: &Path, depth: usize, count: &mut usize) -> Result<(), LaunchError> {
             *count += 1;
@@ -1056,7 +1096,7 @@ mod windows {
                 return Err(error("scm_layout_rejected"));
             }
             let info = no_reparse(path).map_err(|e| error(e.code()))?;
-            protected_acl(path, false)?;
+            protected_acl(path, false, None)?;
             if info.is_dir() {
                 for entry in fs::read_dir(path).map_err(|_| native("scm_directory_read_failed"))? {
                     walk(
@@ -1898,6 +1938,165 @@ mod windows {
         }
 
         #[test]
+        fn ancestor_acl_accepts_actual_root_create_directories_without_mutation() {
+            protected_acl(
+                Path::new(r"C:\"),
+                true,
+                Some(Path::new(r"C:\Program Files")),
+            )
+            .unwrap();
+        }
+
+        fn check_acl_sddl(sddl: &str, scope: AclScope) -> Result<(), LaunchError> {
+            use windows_sys::Win32::Security::{Authorization::*, *};
+            let mut sd = std::ptr::null_mut();
+            let text = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+            assert_ne!(
+                unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        text.as_ptr(),
+                        1,
+                        &mut sd,
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            struct Descriptor(*mut std::ffi::c_void);
+            impl Drop for Descriptor {
+                fn drop(&mut self) {
+                    unsafe {
+                        LocalFree(self.0);
+                    }
+                }
+            }
+            let _memory = Descriptor(sd);
+            let mut owner = std::ptr::null_mut();
+            let mut defaulted = 0;
+            let mut present = 0;
+            let mut acl = std::ptr::null_mut();
+            assert_ne!(
+                unsafe { GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) },
+                0
+            );
+            assert_ne!(
+                unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut acl, &mut defaulted) },
+                0
+            );
+            protected_acl_descriptor(owner, acl, false, scope)
+        }
+
+        #[test]
+        fn ancestor_acl_create_directories_exception_does_not_apply_to_version_objects() {
+            // Effective inherited grants are still rights on the existing object.
+            for flags in ["", "CI", "OICI", "ID", "CIID"] {
+                let sddl = format!("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;{flags};0x4;;;AU)");
+                check_acl_sddl(&sddl, AclScope::ExistingAncestor).unwrap();
+                assert_eq!(
+                    check_acl_sddl(&sddl, AclScope::ProtectedObject)
+                        .unwrap_err()
+                        .code(),
+                    "scm_acl_rejected",
+                    "{sddl}"
+                );
+            }
+        }
+
+        #[test]
+        fn ancestor_acl_replacement_and_security_modification_grants_still_fail_closed() {
+            // AddFile, WriteEA, DeleteChild, WriteAttributes, Delete, WriteDAC,
+            // WriteOwner, GenericWrite and GenericAll, alone or with CreateDirectories.
+            for mask in [
+                0x2, 0x10, 0x40, 0x100, 0x10000, 0x40000, 0x80000, 0x40000000, 0x10000000,
+            ] {
+                for rights in [mask, mask | 0x4] {
+                    for flags in ["", "OICI", "ID"] {
+                        let sddl = format!(
+                            "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;{flags};0x{rights:x};;;BU)"
+                        );
+                        for scope in [AclScope::ExistingAncestor, AclScope::ProtectedObject] {
+                            assert_eq!(
+                                check_acl_sddl(&sddl, scope).unwrap_err().code(),
+                                "scm_acl_rejected",
+                                "{sddl}"
+                            );
+                        }
+                    }
+                }
+            }
+            // A deny does not justify an untrusted parent DELETE_CHILD allow.
+            assert!(check_acl_sddl(
+                "O:BAG:BAD:P(D;;SD;;;BU)(A;;0x40;;;BU)",
+                AclScope::ExistingAncestor
+            )
+            .is_err());
+            for sddl in ["O:BUG:BUD:P(A;;0x4;;;AU)", "O:BAG:BAD:NO_ACCESS_CONTROL"] {
+                assert!(check_acl_sddl(sddl, AclScope::ExistingAncestor).is_err());
+            }
+        }
+
+        #[test]
+        fn ancestor_acl_inherit_only_rights_require_independent_child_check() {
+            // An inherit-only ACE is not effective on the parent; once inherited
+            // onto the selected child it is evaluated there, including at version root.
+            check_acl_sddl(
+                "O:BAG:BAD:P(A;OICIIO;0x40;;;BU)",
+                AclScope::ExistingAncestor,
+            )
+            .unwrap();
+            assert!(
+                check_acl_sddl("O:BAG:BAD:P(A;ID;0x40;;;BU)", AclScope::ExistingAncestor).is_err()
+            );
+            assert!(
+                check_acl_sddl("O:BAG:BAD:P(A;ID;0x4;;;BU)", AclScope::ProtectedObject).is_err()
+            );
+        }
+
+        #[test]
+        fn ancestor_acl_exception_requires_existing_direct_non_reparse_directory() {
+            let f = CoreFixture::new();
+            assert!(matches!(
+                acl_scope(&f.0, Some(&f.0.join("work"))).unwrap(),
+                AclScope::ExistingAncestor
+            ));
+            assert!(matches!(
+                acl_scope(&f.0, None).unwrap(),
+                AclScope::ProtectedObject
+            ));
+            for child in [
+                f.0.join("missing"),
+                f.0.join(SYNTHETIC_ENTRY),
+                f.0.clone(),
+                f.0.join("work/missing"),
+            ] {
+                assert!(acl_scope(&f.0, Some(&child)).is_err(), "{child:?}");
+            }
+            let file = f.0.join("not-a-directory");
+            fs::write(&file, b"synthetic").unwrap();
+            assert!(acl_scope(&f.0, Some(&file)).is_err());
+            assert!(acl_scope(&f.0, Some(&f.0.join("work."))).is_err());
+            assert!(
+                protected_acl(&f.0, false, Some(&f.0.join("work"))).is_err(),
+                "the ancestor exception must not bypass untrusted ownership"
+            );
+            let junction = f.0.join("linked-work");
+            let output = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(&junction)
+                .arg(f.0.join("work"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "synthetic junction creation failed"
+            );
+            let child_result = acl_scope(&f.0, Some(&junction));
+            let parent_result = acl_scope(&junction, Some(&junction.join("missing")));
+            fs::remove_dir(&junction).unwrap();
+            assert!(child_result.is_err() && parent_result.is_err());
+        }
+
+        #[test]
         fn scm_acl_policy_checks_real_windows_security_descriptors_without_mutation() {
             use windows_sys::Win32::Security::{Authorization::*, *};
             for (sddl, accepted) in [
@@ -1936,7 +2135,7 @@ mod windows {
                     },
                     0
                 );
-                let result = protected_acl_descriptor(owner, acl, false);
+                let result = protected_acl_descriptor(owner, acl, false, AclScope::ProtectedObject);
                 unsafe {
                     LocalFree(sd);
                 }
@@ -1947,7 +2146,7 @@ mod windows {
         fn scm_acl_rejects_developer_owned_temporary_tree() {
             let f = CoreFixture::new();
             assert_eq!(
-                protected_acl(&f.0, false).unwrap_err().code(),
+                protected_acl(&f.0, false, None).unwrap_err().code(),
                 "scm_acl_rejected"
             );
             assert_eq!(

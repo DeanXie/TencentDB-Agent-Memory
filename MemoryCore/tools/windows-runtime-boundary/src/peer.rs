@@ -362,6 +362,163 @@ impl TestPeerPolicy {
     }
 }
 
+// Closed, nonproduction SCM profile, not caller-selected token requirements.
+// Actual deployment/token acceptance remains a separate runtime verification.
+const FIXED_SERVICE_ACCOUNT: &str = r"NT SERVICE\CmgRuntimeBoundaryR4ATest";
+// winnt.h values (the existing Cargo features omit the SystemServices module).
+const SYSTEM_INTEGRITY_RID: u32 = 0x4000;
+const GROUP_ENABLED: u32 = 0x4;
+const GROUP_DENY_ONLY: u32 = 0x10;
+#[derive(Clone)]
+pub(crate) struct ScmPeerPolicy {
+    sid: Vec<u8>,
+}
+impl fmt::Debug for ScmPeerPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FixedScmPeerPolicy(redacted)")
+    }
+}
+fn fixed_service_sid() -> Result<Vec<u8>> {
+    let name: Vec<_> = FIXED_SERVICE_ACCOUNT
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let (mut sid_len, mut domain_len) = (0, 0);
+    let mut kind = 0;
+    unsafe {
+        LookupAccountNameW(
+            null(),
+            name.as_ptr(),
+            null_mut(),
+            &mut sid_len,
+            null_mut(),
+            &mut domain_len,
+            &mut kind,
+        );
+    }
+    if !(8..=68).contains(&sid_len) || domain_len > 256 {
+        return Err(PeerError::new("scm_identity_unavailable"));
+    }
+    let mut sid = vec![0u8; sid_len as usize];
+    let mut domain = vec![0u16; (domain_len as usize).max(1)];
+    if unsafe {
+        LookupAccountNameW(
+            null(),
+            name.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut kind,
+        )
+    } == 0
+    {
+        return Err(PeerError::os("scm_identity_unavailable"));
+    }
+    copy_sid(sid.as_mut_ptr().cast())
+}
+fn service_groups(token: HANDLE, service_sid: &[u8]) -> Result<(bool, bool)> {
+    let buffer = token_info(token, TokenGroups)?;
+    parse_service_groups(&buffer, service_sid)
+}
+fn parse_service_groups(buffer: &[usize], service_sid: &[u8]) -> Result<(bool, bool)> {
+    if std::mem::size_of_val(buffer) < std::mem::offset_of!(TOKEN_GROUPS, Groups) {
+        return Err(PeerError::new("scm_identity_unavailable"));
+    }
+    let start = buffer.as_ptr() as usize;
+    let end = start + std::mem::size_of_val(buffer);
+    let groups = buffer.as_ptr().cast::<TOKEN_GROUPS>();
+    let count = unsafe { (*groups).GroupCount } as usize;
+    let offset = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+    if count > 128 || offset + count * size_of::<SID_AND_ATTRIBUTES>() > end - start {
+        return Err(PeerError::new("scm_identity_unavailable"));
+    }
+    let entries = unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::addr_of!((*groups).Groups).cast::<SID_AND_ATTRIBUTES>(),
+            count,
+        )
+    };
+    let mut enabled_service = false;
+    let mut administrators = false;
+    // S-1-5-32-544; even a deny-only administrator group is outside this profile.
+    let admin_sid = [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0];
+    for entry in entries {
+        let p = entry.Sid as usize;
+        if p < start || p > end.saturating_sub(8) {
+            return Err(PeerError::new("scm_identity_unavailable"));
+        }
+        let sid_len = 8 + 4 * usize::from(unsafe { *entry.Sid.cast::<u8>().add(1) });
+        if sid_len > end - p || sid_len > 68 {
+            return Err(PeerError::new("scm_identity_unavailable"));
+        }
+        let sid = copy_sid(entry.Sid)?;
+        enabled_service |= sid == service_sid
+            && entry.Attributes & GROUP_ENABLED != 0
+            && entry.Attributes & GROUP_DENY_ONLY == 0;
+        administrators |= sid == admin_sid;
+    }
+    Ok((enabled_service, administrators))
+}
+impl ScmPeerPolicy {
+    pub(crate) fn current() -> Result<Self> {
+        // Reject ordinary/unconfirmed token shapes before account lookup (which
+        // may initialize Windows RPC state). This is not an identity grant:
+        // the fixed account, service group and administrator checks still follow.
+        let token = process_token(unsafe { GetCurrentProcess() })?;
+        if token.integrity != SYSTEM_INTEGRITY_RID
+            || token.elevated
+            || !service_user_sid(&token.sid)
+        {
+            return Err(PeerError::new("peer_identity_denied"));
+        }
+        let policy = Self {
+            sid: fixed_service_sid()?,
+        };
+        PeerPolicy::Scm(policy.clone()).process_snapshot(unsafe { GetCurrentProcess() })?;
+        Ok(policy)
+    }
+    fn accepts(&self, t: &TokenSnapshot, enabled_service: bool, administrators: bool) -> bool {
+        t.sid == self.sid
+            && t.integrity == SYSTEM_INTEGRITY_RID
+            && !t.elevated
+            && enabled_service
+            && !administrators
+    }
+}
+fn service_user_sid(sid: &[u8]) -> bool {
+    sid.len() >= 12 && sid[2..8] == [0, 0, 0, 0, 0, 5] && sid[8..12] == 80u32.to_le_bytes()
+}
+#[derive(Clone, Debug)]
+enum PeerPolicy {
+    Test(TestPeerPolicy),
+    Scm(ScmPeerPolicy),
+}
+impl PeerPolicy {
+    fn snapshot(&self, token: HANDLE) -> Result<TokenSnapshot> {
+        let t = token_snapshot(token)?;
+        let accepted = match self {
+            Self::Test(p) => p.accepts(&t),
+            Self::Scm(p) => {
+                let (service, admin) = service_groups(token, &p.sid)?;
+                p.accepts(&t, service, admin)
+            }
+        };
+        if !accepted {
+            return Err(PeerError::new("peer_identity_denied"));
+        }
+        Ok(t)
+    }
+    fn process_snapshot(&self, process: HANDLE) -> Result<TokenSnapshot> {
+        let mut raw = null_mut();
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut raw) } == 0 {
+            return Err(PeerError::os("token_unavailable"));
+        }
+        let token = Handle::checked(raw, "token_unavailable")?;
+        self.snapshot(token.0)
+    }
+}
+
 struct ImpersonationGuard {
     active: bool,
 }
@@ -382,6 +539,12 @@ impl Drop for ImpersonationGuard {
     }
 }
 fn impersonated_token(pipe: HANDLE) -> Result<TokenSnapshot> {
+    with_impersonated_token(pipe, token_snapshot)
+}
+fn with_impersonated_token(
+    pipe: HANDLE,
+    inspect: impl FnOnce(HANDLE) -> Result<TokenSnapshot>,
+) -> Result<TokenSnapshot> {
     if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
         return Err(PeerError::os("impersonation_failed"));
     }
@@ -396,7 +559,7 @@ fn impersonated_token(pipe: HANDLE) -> Result<TokenSnapshot> {
         if unsafe { *level.as_ptr().cast::<i32>() } < SecurityImpersonation {
             return Err(PeerError::new("impersonation_insufficient"));
         }
-        token_snapshot(token.0)
+        inspect(token.0)
     })();
     // While impersonating, only token inspection and cleanup are performed.
     guard.revert();
@@ -510,7 +673,7 @@ impl Pipe {
 fn check_process(
     pipe: &Pipe,
     expected: &PinnedProcess,
-    policy: &TestPeerPolicy,
+    policy: &PeerPolicy,
     client: bool,
 ) -> Result<()> {
     pipe.check_cancel()?;
@@ -530,7 +693,8 @@ fn check_process(
         return Err(PeerError::new("process_identity_mismatch"));
     }
     let observed = PinnedProcess::open_test_peer(id, expected.created)?;
-    if observed.token.sid != expected.token.sid || !policy.accepts(&observed.token) {
+    let token = policy.process_snapshot(observed.handle.0)?;
+    if token.sid != expected.token.sid {
         return Err(PeerError::new("peer_identity_denied"));
     }
     expected.alive()?;
@@ -548,9 +712,16 @@ impl TestPipeServer {
     }
     pub fn bind_name(name: PipeName) -> Result<Self> {
         let policy = TestPeerPolicy::current()?;
+        Self::bind_sid(name, &policy.sid)
+    }
+    pub(crate) fn bind_scm(policy: &ScmPeerPolicy) -> Result<Self> {
+        Self::bind_sid(PipeName::random()?, &policy.sid)
+    }
+    fn bind_sid(name: PipeName, allowed_sid: &[u8]) -> Result<Self> {
         let mut sid_string = null_mut();
-        if unsafe { ConvertSidToStringSidW(policy.sid.as_ptr().cast_mut().cast(), &mut sid_string) }
-            == 0
+        if unsafe {
+            ConvertSidToStringSidW(allowed_sid.as_ptr().cast_mut().cast(), &mut sid_string)
+        } == 0
         {
             return Err(PeerError::os("dacl_failed"));
         }
@@ -624,7 +795,7 @@ impl TestPipeServer {
         policy: &TestPeerPolicy,
         timeout: Duration,
     ) -> Result<PeerSession<'a>> {
-        self.accept_inner(expected, policy, timeout, None)
+        self.accept_inner(expected, PeerPolicy::Test(policy.clone()), timeout, None)
     }
     /// Test-only authentication with the caller's existing R2 cancellation state.
     /// On observed cancellation this consumes/closes the pipe and returns an error.
@@ -635,12 +806,31 @@ impl TestPipeServer {
         timeout: Duration,
         cancel: &CancelToken,
     ) -> Result<PeerSession<'a>> {
-        self.accept_inner(expected, policy, timeout, Some(cancel.clone()))
+        self.accept_inner(
+            expected,
+            PeerPolicy::Test(policy.clone()),
+            timeout,
+            Some(cancel.clone()),
+        )
+    }
+    pub(crate) fn accept_scm_cancellable<'a>(
+        self,
+        expected: &'a PinnedProcess,
+        policy: &ScmPeerPolicy,
+        timeout: Duration,
+        cancel: &CancelToken,
+    ) -> Result<PeerSession<'a>> {
+        self.accept_inner(
+            expected,
+            PeerPolicy::Scm(policy.clone()),
+            timeout,
+            Some(cancel.clone()),
+        )
     }
     fn accept_inner<'a>(
         mut self,
         expected: &'a PinnedProcess,
-        policy: &TestPeerPolicy,
+        policy: PeerPolicy,
         timeout: Duration,
         cancel: Option<CancelToken>,
     ) -> Result<PeerSession<'a>> {
@@ -665,16 +855,16 @@ impl TestPipeServer {
         if self.pipe.read(end)? != HELLO {
             return Err(PeerError::new("invalid_message"));
         }
-        let token = impersonated_token(self.pipe.handle.0)?;
-        if !policy.accepts(&token) || token.sid != expected.token.sid {
+        let token = with_impersonated_token(self.pipe.handle.0, |t| policy.snapshot(t))?;
+        if token.sid != expected.token.sid {
             return Err(PeerError::new("peer_identity_denied"));
         }
-        check_process(&self.pipe, expected, policy, true)?;
+        check_process(&self.pipe, expected, &policy, true)?;
         self.pipe.check_cancel()?;
         Ok(PeerSession {
             pipe: Some(self.pipe),
             expected,
-            policy: policy.clone(),
+            policy,
             end,
             session: random()?,
             challenge: None,
@@ -707,7 +897,7 @@ pub struct PeerReceipt {
 pub struct PeerSession<'a> {
     pipe: Option<Pipe>,
     expected: &'a PinnedProcess,
-    policy: TestPeerPolicy,
+    policy: PeerPolicy,
     end: Instant,
     session: [u8; 32],
     challenge: Option<(Challenge, Instant)>,
@@ -785,8 +975,8 @@ impl PeerSession<'_> {
             if response != *challenge {
                 return Err(PeerError::new("challenge_mismatch"));
             }
-            let token = impersonated_token(pipe.handle.0)?;
-            if !self.policy.accepts(&token) || token.sid != self.expected.token.sid {
+            let token = with_impersonated_token(pipe.handle.0, |t| self.policy.snapshot(t))?;
+            if token.sid != self.expected.token.sid {
                 return Err(PeerError::new("peer_identity_denied"));
             }
             check_process(pipe, self.expected, &self.policy, true)?;
@@ -822,7 +1012,7 @@ pub enum ClientTokenQuality {
 pub struct TestPipeClient<'a> {
     pipe: Option<Pipe>,
     expected: &'a PinnedProcess,
-    policy: TestPeerPolicy,
+    policy: PeerPolicy,
     end: Instant,
 }
 impl<'a> TestPipeClient<'a> {
@@ -852,11 +1042,46 @@ impl<'a> TestPipeClient<'a> {
         timeout: Duration,
         cancel: Option<CancelToken>,
     ) -> Result<Self> {
+        let policy = PeerPolicy::Test(TestPeerPolicy::current()?);
+        Self::connect_with_policy(name, expected, quality, timeout, cancel, policy)
+    }
+    // Fixed-child entry only. Mode derives from the actual pinned parent token,
+    // never a bootstrap flag/SID/PID claim. Non-Medium parents cannot fall back.
+    pub(crate) fn connect_fixed_child(
+        name: &PipeName,
+        expected: &'a PinnedProcess,
+        timeout: Duration,
+    ) -> Result<Self> {
+        // S-1-5-80-* is a service user, even if its integrity was unexpectedly
+        // lowered. Such a token must never enter the legacy Medium fallback.
+        let service_user = service_user_sid(&expected.token.sid);
+        let policy =
+            if expected.token.integrity == 8192 && !expected.token.elevated && !service_user {
+                PeerPolicy::Test(TestPeerPolicy::current()?)
+            } else {
+                PeerPolicy::Scm(ScmPeerPolicy::current()?)
+            };
+        Self::connect_with_policy(
+            name,
+            expected,
+            ClientTokenQuality::Impersonation,
+            timeout,
+            None,
+            policy,
+        )
+    }
+    fn connect_with_policy(
+        name: &PipeName,
+        expected: &'a PinnedProcess,
+        quality: ClientTokenQuality,
+        timeout: Duration,
+        cancel: Option<CancelToken>,
+        policy: PeerPolicy,
+    ) -> Result<Self> {
         let end = deadline(timeout)?;
         if cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
             return Err(PeerError::new("peer_cancelled"));
         }
-        let policy = TestPeerPolicy::current()?;
         let flags = SECURITY_SQOS_PRESENT
             | match quality {
                 ClientTokenQuality::Anonymous => SECURITY_ANONYMOUS,
@@ -957,5 +1182,125 @@ impl<'a> TestPipeClient<'a> {
     }
     pub fn wait_for_close(&mut self) -> Result<()> {
         self.with_pipe(|client, pipe| pipe.read(client.end).map(|_| ()))
+    }
+}
+
+#[cfg(test)]
+mod scm_policy_tests {
+    use super::*;
+    fn model() -> (ScmPeerPolicy, TokenSnapshot) {
+        // Synthetic token facts only: no Windows token is created or altered.
+        let sid = vec![1, 1, 0, 0, 0, 0, 0, 5, 80, 0, 0, 0];
+        (
+            ScmPeerPolicy { sid: sid.clone() },
+            TokenSnapshot {
+                sid,
+                integrity: SYSTEM_INTEGRITY_RID,
+                elevated: false,
+            },
+        )
+    }
+    #[test]
+    fn scm_profile_is_closed_and_does_not_change_medium_test_policy() {
+        let (scm, mut t) = model();
+        let test = TestPeerPolicy { sid: t.sid.clone() };
+        assert!(scm.accepts(&t, true, false));
+        assert!(!test.accepts(&t));
+        for integrity in [0, 4096, 8192, 12288, 16385, 20480] {
+            t.integrity = integrity;
+            assert!(!scm.accepts(&t, true, false));
+        }
+        t.integrity = 8192;
+        assert!(test.accepts(&t));
+        t.elevated = true;
+        assert!(!test.accepts(&t));
+        t.integrity = SYSTEM_INTEGRITY_RID;
+        assert!(!scm.accepts(&t, true, false));
+    }
+    #[test]
+    fn scm_profile_rejects_missing_service_group_admin_and_wrong_user() {
+        let (scm, mut t) = model();
+        assert!(!scm.accepts(&t, false, false));
+        assert!(!scm.accepts(&t, true, true));
+        t.sid[8] ^= 1;
+        assert!(!scm.accepts(&t, true, false));
+    }
+    #[test]
+    fn ordinary_process_cannot_construct_scm_policy_or_change_test_policy() {
+        let mut before = 0;
+        assert_ne!(
+            unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut before) },
+            0
+        );
+        for _ in 0..16 {
+            assert!(ScmPeerPolicy::current().is_err());
+        }
+        let mut after = 0;
+        assert_ne!(
+            unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut after) },
+            0
+        );
+        assert!(
+            after <= before + 2,
+            "rejected SCM constructors leaked token handles"
+        );
+        let current = PinnedProcess::current().unwrap();
+        assert!(TestPeerPolicy::current().unwrap().accepts(&current.token));
+    }
+    #[test]
+    fn service_group_parser_rejects_missing_and_truncated_evidence() {
+        let (scm, _) = model();
+        assert!(parse_service_groups(&[], &scm.sid).is_err());
+        let mut truncated = vec![0usize; 2];
+        truncated[0] = 129;
+        assert!(parse_service_groups(&truncated, &scm.sid).is_err());
+        truncated[0] = 1;
+        assert!(parse_service_groups(&truncated, &scm.sid).is_err());
+        let mut raw = null_mut();
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) },
+            0
+        );
+        let token = Handle::checked(raw, "token_unavailable").unwrap();
+        let fixed = fixed_service_sid().unwrap();
+        assert!(!service_groups(token.0, &fixed).unwrap().0);
+    }
+    #[test]
+    fn service_group_parser_requires_enabled_not_deny_only_and_bounded_sid() {
+        let (scm, _) = model();
+        let offset = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+        let sid_offset = offset + size_of::<SID_AND_ATTRIBUTES>();
+        let mut buffer = vec![0usize; (sid_offset + scm.sid.len()).div_ceil(size_of::<usize>())];
+        let raw = buffer.as_mut_ptr().cast::<u8>();
+        let groups = raw.cast::<TOKEN_GROUPS>();
+        unsafe {
+            (*groups).GroupCount = 1;
+            (*groups).Groups[0].Sid = raw.add(sid_offset).cast();
+            std::ptr::copy_nonoverlapping(scm.sid.as_ptr(), raw.add(sid_offset), scm.sid.len());
+        }
+        for (flags, enabled) in [
+            (0, false),
+            (2, false),
+            (GROUP_DENY_ONLY, false),
+            (GROUP_ENABLED | GROUP_DENY_ONLY, false),
+            (GROUP_ENABLED, true),
+            (GROUP_ENABLED | 2 | 8, true),
+        ] {
+            unsafe {
+                (*groups).Groups[0].Attributes = flags;
+            }
+            assert_eq!(
+                parse_service_groups(&buffer, &scm.sid).unwrap(),
+                (enabled, false)
+            );
+        }
+        unsafe {
+            (*groups).Groups[0].Sid = std::ptr::null_mut();
+        }
+        assert!(parse_service_groups(&buffer, &scm.sid).is_err());
+        unsafe {
+            (*groups).Groups[0].Sid = raw.add(buffer.len() * size_of::<usize>() - 4).cast();
+        }
+        assert!(parse_service_groups(&buffer, &scm.sid).is_err());
     }
 }

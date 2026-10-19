@@ -1,7 +1,7 @@
 //! R4A test-only SCM host. No service installation, Gateway, issuer or verifier.
 //! Offline sinks exercise lifecycle logic; they do not prove actual SCM behavior.
 use crate::launch::{self, CancelToken, LaunchOutcome, LaunchReport, LaunchRequest, StartedChild};
-use crate::peer::{PeerError, PinnedProcess, TestPeerPolicy, TestPipeServer};
+use crate::peer::{PeerError, PinnedProcess, ScmPeerPolicy, TestPeerPolicy, TestPipeServer};
 use std::{
     cell::Cell,
     ffi::OsString,
@@ -462,6 +462,8 @@ struct ProcessState {
     report: Option<LaunchReport>,
     ipc_case: Option<SyntheticIpcCase>,
     ipc: Option<SyntheticIpcReport>,
+    // Set only by the internal, authorized SCM entry. Not part of IpcGate.
+    scm_peer: bool,
 }
 /// Fixed client behaviours for the closed offline integration-test executable.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -598,13 +600,8 @@ fn run_fixed_ipc_client(bytes: &[u8]) -> Result<(), ServiceError> {
     if gate.case == SyntheticIpcCase::ConnectWait {
         return fixed_client_wait(&parent);
     }
-    let mut client = TestPipeClient::connect(
-        &name,
-        &parent,
-        crate::peer::ClientTokenQuality::Impersonation,
-        Duration::from_secs(3),
-    )
-    .map_err(peer_failure)?;
+    let mut client = TestPipeClient::connect_fixed_child(&name, &parent, Duration::from_secs(3))
+        .map_err(peer_failure)?;
     let challenge = client.challenge().map_err(peer_failure)?;
     if gate.case == SyntheticIpcCase::ChallengeWait {
         let _ = client.wait_for_close();
@@ -635,6 +632,7 @@ fn ipc_exchange(
     cancel: &CancelToken,
     control: &Control,
     state: &Mutex<ProcessState>,
+    scm_policy: Option<&ScmPeerPolicy>,
 ) -> Result<bool, ServiceError> {
     let expected = PinnedProcess::from_controlled_child(started).map_err(peer_failure)?;
     let wrong;
@@ -647,8 +645,11 @@ fn ipc_exchange(
     let policy = TestPeerPolicy::current().map_err(peer_failure)?;
     control.ipc_stage.store(1, Ordering::SeqCst);
     let result = (|| {
-        let mut session =
-            server.accept_cancellable(pin, &policy, Duration::from_secs(3), cancel)?;
+        let mut session = if let Some(scm) = scm_policy {
+            server.accept_scm_cancellable(pin, scm, Duration::from_secs(3), cancel)?
+        } else {
+            server.accept_cancellable(pin, &policy, Duration::from_secs(3), cancel)?
+        };
         session.issue_challenge(Duration::from_secs(2))?;
         control.ipc_stage.store(2, Ordering::SeqCst);
         if case == SyntheticIpcCase::LateResponse {
@@ -781,7 +782,20 @@ impl Worker {
                     .ipc_case;
                 let ipc_setup = if let Some(case) = ipc_case {
                     (|| {
-                        let server = TestPipeServer::bind().map_err(peer_failure)?;
+                        let scm_policy = if thread_state
+                            .lock()
+                            .map_err(|_| ServiceError::new("worker_lock_poisoned"))?
+                            .scm_peer
+                        {
+                            Some(ScmPeerPolicy::current().map_err(peer_failure)?)
+                        } else {
+                            None
+                        };
+                        let server = match &scm_policy {
+                            Some(policy) => TestPipeServer::bind_scm(policy),
+                            None => TestPipeServer::bind(),
+                        }
+                        .map_err(peer_failure)?;
                         let parent = PinnedProcess::current().map_err(peer_failure)?;
                         let gate = serde_json::to_vec(&IpcGate {
                             pipe: server.name().as_str().into(),
@@ -790,13 +804,13 @@ impl Worker {
                             case,
                         })
                         .map_err(|_| ServiceError::new("ipc_gate_invalid"))?;
-                        Ok::<_, ServiceError>((Some(server), gate))
+                        Ok::<_, ServiceError>((Some(server), gate, scm_policy))
                     })()
                 } else {
-                    Ok((None, Vec::new()))
+                    Ok((None, Vec::new(), None))
                 };
                 let mut ipc_failure = None;
-                let (mut server, gate) = match ipc_setup {
+                let (mut server, gate, scm_policy) = match ipc_setup {
                     Ok(setup) => setup,
                     Err(e) => {
                         *thread_startup.lock().unwrap_or_else(|p| p.into_inner()) =
@@ -818,6 +832,7 @@ impl Worker {
                                 &cancel,
                                 &thread_control,
                                 &thread_state,
+                                scm_policy.as_ref(),
                             ) {
                                 Ok(true) => {}
                                 Ok(false) => return Ok(()),
@@ -1246,6 +1261,7 @@ fn run_scm_engine(
         Ok(None) => run_engine(sink, control, None),
         Ok(Some(request)) => {
             let state = Arc::new(Mutex::new(ProcessState {
+                scm_peer: true,
                 ipc_case: Some(SyntheticIpcCase::Authenticate),
                 ipc: Some(SyntheticIpcReport::default()),
                 ..Default::default()
@@ -2033,7 +2049,32 @@ mod r4b_tests {
         launch::offline_scm_candidate(&hostpath, CancelToken::new()).unwrap()
     }
     #[test]
-    fn scm_authorized_candidate_reuses_engine_receipt_and_cleanup() {
+    fn scm_policy_does_not_fall_back_to_medium_developer_identity() {
+        let f = RaceFixture::new();
+        let request = authorized_fixture(&f);
+        let trace = Trace::default();
+        let control = Arc::new(Control::new());
+        struct StopRunning(Sink, Arc<Control>);
+        impl StatusSink for StopRunning {
+            fn report(&mut self, s: ServiceSnapshot) -> Result<(), ServiceError> {
+                self.0.report(s)?;
+                if s.phase == ServicePhase::Running {
+                    self.1.request_stop()?;
+                }
+                Ok(())
+            }
+        }
+        let mut output = StopRunning(sink(&trace), control.clone());
+        let result = run_scm_engine(&mut output, control, Ok(Some(request)));
+        assert!(
+            result.is_err(),
+            "an offline candidate must not authorize a developer token as an SCM peer"
+        );
+        assert!(!phases(&trace).contains(&ServicePhase::Running));
+        assert_closed(&trace);
+    }
+    #[test]
+    fn offline_authorized_candidate_reuses_engine_receipt_and_cleanup() {
         let f = RaceFixture::new();
         let request = authorized_fixture(&f);
         let control = SyntheticProcessControl::new();
@@ -2057,7 +2098,20 @@ mod r4b_tests {
             stop_control.request_stop().unwrap();
         });
         let mut output = StopSink(&mut output, tx);
-        let result = run_scm_engine(&mut output, control.inner.clone(), Ok(Some(request))).unwrap();
+        // Content-only offline authorization is deliberately not an SCM token.
+        // Exercise the same engine with the unchanged offline test-peer policy.
+        let state = Arc::new(Mutex::new(ProcessState {
+            ipc_case: Some(SyntheticIpcCase::Authenticate),
+            ipc: Some(SyntheticIpcReport::default()),
+            ..Default::default()
+        }));
+        let result = run_engine_with_process(
+            &mut output,
+            control.inner.clone(),
+            None,
+            Some((request, state)),
+        )
+        .unwrap();
         stopper.join().unwrap();
         assert!(
             result.prepared_before_running && result.worker_joined && result.resources_released
@@ -2099,16 +2153,17 @@ mod r4b_tests {
         );
     }
     #[test]
-    fn scm_authorized_candidate_stop_before_spawn_has_no_late_running() {
+    fn scm_preaccepted_stop_does_not_bypass_service_identity_validation() {
         let f = RaceFixture::new();
         let request = authorized_fixture(&f);
         let control = Arc::new(Control::new());
         control.request_stop().unwrap();
         let trace = Trace::default();
         let mut output = sink(&trace);
-        let report = run_scm_engine(&mut output, control, Ok(Some(request))).unwrap();
-        assert!(report.worker_joined && report.resources_released);
+        let error = run_scm_engine(&mut output, control, Ok(Some(request))).unwrap_err();
+        assert_eq!(error.code(), "peer_identity_denied");
         assert!(!phases(&trace).contains(&ServicePhase::Running));
+        assert_closed(&trace);
     }
 
     #[test]

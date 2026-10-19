@@ -317,6 +317,54 @@ fn direct_binary_execution_cannot_connect_to_scm() {
     println!("R4A_DIRECT_EXECUTION=exit:2;native:1063;SCM:false");
 }
 #[test]
+fn standalone_child_cannot_self_declare_scm_policy_in_bootstrap() {
+    use std::io::Write;
+    use windows_runtime_boundary::peer::{PinnedProcess, PipeName};
+    let parent = PinnedProcess::current().unwrap();
+    for field in ["scm_peer", "service_sid", "verified_service"] {
+        let mut gate = serde_json::json!({"parent":parent.id(),"created":parent.creation_time(),
+            "pipe":PipeName::random().unwrap().as_str(),"case":"Authenticate"});
+        gate[field] = serde_json::json!(true);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cmg-runtime-boundary-ipc-child"))
+            .env_clear()
+            .env("SystemRoot", r"C:\Windows")
+            .current_dir(std::env::temp_dir())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        input.write_all(b"R2_GO\n").unwrap();
+        input
+            .write_all(&serde_json::to_vec(&gate).unwrap())
+            .unwrap();
+        drop(input);
+        let end = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= end {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("forged SCM bootstrap did not fail within its bound");
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(status.code(), Some(2));
+        let mut error = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .take(2048)
+            .read_to_string(&mut error)
+            .unwrap();
+        assert!(error.contains("ipc_gate_invalid"), "{field}: {error}");
+    }
+}
+#[test]
 fn forged_environment_cannot_enable_gateway_or_service_mode() {
     let (code, text) = run_binary(&[], true);
     assert_eq!(code, 2);

@@ -250,6 +250,54 @@ fn wrong_sid_is_rejected() {
     finish(&mut c);
 }
 #[test]
+fn caller_claiming_fixed_service_sid_does_not_upgrade_a_medium_peer() {
+    let name: Vec<_> = r"NT SERVICE\CmgRuntimeBoundaryR4ATest"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let (mut sid_len, mut domain_len) = (0, 0);
+    let mut kind = 0;
+    unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut sid_len,
+            std::ptr::null_mut(),
+            &mut domain_len,
+            &mut kind,
+        );
+    }
+    assert!((8..=68).contains(&sid_len) && domain_len < 256);
+    let mut sid = vec![0u8; sid_len as usize];
+    let mut domain = vec![0u16; (domain_len as usize).max(1)];
+    assert_ne!(
+        unsafe {
+            LookupAccountNameW(
+                std::ptr::null(),
+                name.as_ptr(),
+                sid.as_mut_ptr().cast(),
+                &mut sid_len,
+                domain.as_mut_ptr(),
+                &mut domain_len,
+                &mut kind,
+            )
+        },
+        0
+    );
+    let server = TestPipeServer::bind().unwrap();
+    let mut c = child(server.name(), "denied", None);
+    let expected = PinnedProcess::from_child(&c.0).unwrap();
+    // This existing public test API accepts an expected SID, not an SCM capability.
+    let claim = TestPeerPolicy::from_sid(&sid).unwrap();
+    assert_eq!(
+        server.accept(&expected, &claim, WAIT).unwrap_err().code(),
+        "peer_identity_denied"
+    );
+    finish(&mut c);
+    assert_server_token_restored();
+}
+#[test]
 fn insufficient_policy_identity_fails_closed() {
     assert_eq!(
         TestPeerPolicy::from_sid(&[]).unwrap_err().code(),

@@ -56,6 +56,8 @@ pub enum LaunchTarget {
     SyntheticIpc,
     /// Fixed ordinary Cargo bin, still offline and nonauthoritative.
     StandaloneIpc,
+    #[doc(hidden)]
+    ScmIpc(ScmIpcAuthorization),
     Gateway,
     ProtectedGateway,
 }
@@ -70,6 +72,19 @@ pub struct LaunchRequest {
     pub environment_overrides: Vec<(String, String)>,
     pub timeout: Duration,
     pub cancel: CancelToken,
+}
+/// Opaque, crate-created authorization. Hashes bind content, not publisher identity.
+#[derive(Clone, Copy, Debug)]
+pub struct ScmIpcAuthorization {
+    record_digest: [u8; 32],
+    #[cfg(test)]
+    offline: bool,
+}
+/// Content inspection only; this never grants SCM launch authority.
+impl LaunchRequest {
+    pub fn inspect_scm_ipc_candidate(host: &std::path::Path) -> Result<(), LaunchError> {
+        windows::read_candidate(host).map(|_| ())
+    }
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum LaunchOutcome {
@@ -148,6 +163,16 @@ impl LaunchRequest {
             Err(error("platform_unavailable"))
         }
     }
+}
+pub(crate) fn scm_ipc_request(cancel: CancelToken) -> Result<Option<LaunchRequest>, LaunchError> {
+    windows::scm_request(cancel)
+}
+#[cfg(test)]
+pub(crate) fn offline_scm_candidate(
+    host: &std::path::Path,
+    cancel: CancelToken,
+) -> Result<LaunchRequest, LaunchError> {
+    windows::offline_candidate(host, cancel)
 }
 #[derive(Debug)]
 pub struct LaunchError {
@@ -796,15 +821,355 @@ mod windows {
         }
         Ok(artifact)
     }
+
+    const AUTH_FILE: &str = "ipc-start-authorization.json";
+    const HOST_FILE: &str = "cmg-runtime-boundary-test-service.exe";
+    const MANIFEST_FILE: &str = "ipc-manifest-v2.json";
+    const PROTECTED_RELEASES: &str = r"C:\Program Files\TencentDBAgentMemory-L4Test\releases";
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StartAuthorization {
+        schema_version: u32,
+        purpose: String,
+        service_name: String,
+        host_sha256: String,
+        child_sha256: String,
+        manifest_sha256: String,
+        artifact_id: String,
+    }
+    fn digest(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+    fn bounded_file(path: &Path, limit: u64) -> Result<Vec<u8>, LaunchError> {
+        let info = no_reparse(path).map_err(|e| error(e.code()))?;
+        no_extra_streams_v2(path).map_err(|e| error(e.code()))?;
+        if !info.is_file() || info.len() == 0 || info.len() > limit {
+            return Err(error("scm_file_rejected"));
+        }
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .and_then(|f| f.take(limit + 1).read_to_end(&mut bytes))
+            .map_err(|_| native("scm_file_read_failed"))?;
+        if bytes.len() as u64 > limit {
+            return Err(error("scm_file_rejected"));
+        }
+        Ok(bytes)
+    }
+    // Independent content inspection deliberately creates NO launch capability.
+    pub(super) fn read_candidate(host: &Path) -> Result<(Vec<u8>, [u8; 32]), LaunchError> {
+        if host.file_name() != Some(OsStr::new(HOST_FILE)) {
+            return Err(error("scm_host_rejected"));
+        }
+        let version = host.parent().ok_or_else(|| error("scm_path_rejected"))?;
+        validate_root_v2(version).map_err(|e| error(e.code()))?;
+        no_reparse(host).map_err(|e| error(e.code()))?;
+        no_extra_streams_v2(host).map_err(|e| error(e.code()))?;
+        let raw = bounded_file(&version.join(AUTH_FILE), 16384)?;
+        let auth: StartAuthorization =
+            serde_json::from_slice(&raw).map_err(|_| error("scm_authorization_invalid"))?;
+        if auth.schema_version != 1
+            || auth.purpose != "cmg-fixed-ipc-test-start"
+            || auth.service_name != "CmgRuntimeBoundaryR4ATest"
+        {
+            return Err(error("scm_authorization_invalid"));
+        }
+        let manifest = bounded_file(&version.join(MANIFEST_FILE), 8 * 1024 * 1024)?;
+        let tree = version.join("ipc-fixture");
+        validate_release_v2(&tree, &manifest).map_err(|e| error(e.code()))?;
+        let child = tree.join(STANDALONE_IPC_ENTRY);
+        let expected_id = format!(
+            "ipc-{}",
+            digest(
+                format!(
+                    "{}{}{}",
+                    auth.host_sha256, auth.child_sha256, auth.manifest_sha256
+                )
+                .as_bytes()
+            )
+        );
+        if hash_tool(host)? != auth.host_sha256
+            || hash_tool(&child)? != auth.child_sha256
+            || digest(&manifest) != auth.manifest_sha256
+            || auth.artifact_id != expected_id
+            || version.file_name() != Some(OsStr::new(&expected_id))
+        {
+            return Err(error("scm_content_identity_mismatch"));
+        }
+        let mut names = fs::read_dir(version)
+            .map_err(|_| native("scm_directory_read_failed"))?
+            .take(5)
+            .map(|e| e.map(|x| x.file_name()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| native("scm_directory_read_failed"))?;
+        names.sort();
+        let mut expected = vec![AUTH_FILE, HOST_FILE, MANIFEST_FILE, "ipc-fixture"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        expected.sort();
+        if names != expected {
+            return Err(error("scm_extra_file"));
+        }
+        let m: Value = serde_json::from_slice(&manifest).map_err(|_| error("manifest_invalid"))?;
+        let mut files = FIXTURE_FILES.to_vec();
+        files.push(STANDALONE_IPC_ENTRY);
+        files.sort();
+        let entries = m["files"]
+            .as_array()
+            .ok_or_else(|| error("manifest_invalid"))?;
+        if entries.len() != files.len()
+            || entries.iter().zip(files).any(|(v, p)| v["path"] != p)
+            || m["directories"] != serde_json::json!(FIXTURE_DIRS)
+        {
+            return Err(error("synthetic_fixture_invalid"));
+        }
+        exact_file(
+            &tree.join(SYNTHETIC_ENTRY),
+            SYNTHETIC_ENTRY_SOURCE.as_bytes(),
+        )?;
+        exact_file(&tree.join("app/package.json"), SYNTHETIC_PACKAGE.as_bytes())?;
+        Ok((manifest, Sha256::digest(&raw).into()))
+    }
+    // Conservative Windows ACL policy. Unsupported ACEs fail closed; no AccessCheck
+    // shortcut or owner-name inference. Denies never justify an untrusted write grant.
+    fn protected_acl(path: &Path, allow_servicing_owner: bool) -> Result<(), LaunchError> {
+        use windows_sys::Win32::Security::{Authorization::*, *};
+        struct Local(*mut std::ffi::c_void);
+        impl Drop for Local {
+            fn drop(&mut self) {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+        let mut owner = std::ptr::null_mut();
+        let mut acl = std::ptr::null_mut();
+        let mut sd = std::ptr::null_mut();
+        let code = unsafe {
+            GetNamedSecurityInfoW(
+                wide(path.as_os_str())?.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut acl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        let _memory = Local(sd);
+        if code != 0 {
+            return Err(LaunchError {
+                code: "scm_acl_query_failed",
+                os_error: Some(code as i32),
+            });
+        }
+        protected_acl_descriptor(owner, acl, allow_servicing_owner)
+    }
+    fn protected_acl_descriptor(
+        owner: windows_sys::Win32::Security::PSID,
+        acl: *mut windows_sys::Win32::Security::ACL,
+        allow_servicing_owner: bool,
+    ) -> Result<(), LaunchError> {
+        use windows_sys::Win32::Security::{Authorization::*, *};
+        struct Local(*mut std::ffi::c_void);
+        impl Drop for Local {
+            fn drop(&mut self) {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+        fn sid_text(sid: PSID) -> Result<String, LaunchError> {
+            if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+                return Err(error("scm_acl_rejected"));
+            }
+            let mut text = std::ptr::null_mut();
+            if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+                return Err(native("scm_acl_query_failed"));
+            }
+            let _memory = Local(text.cast());
+            let mut n = 0;
+            while n < 256 && unsafe { *text.add(n) } != 0 {
+                n += 1;
+            }
+            if n == 256 {
+                return Err(error("scm_acl_rejected"));
+            }
+            Ok(String::from_utf16_lossy(unsafe {
+                std::slice::from_raw_parts(text, n)
+            }))
+        }
+        let trusted = |s: &str| {
+            s == "S-1-5-18"
+                || s == "S-1-5-32-544"
+                || (allow_servicing_owner
+                    && s == "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
+        };
+        if !trusted(&sid_text(owner)?) || acl.is_null() || unsafe { IsValidAcl(acl) } == 0 {
+            return Err(error("scm_acl_rejected"));
+        }
+        let write_mask = 0x500d0156u32;
+        for i in 0..unsafe { (*acl).AceCount } {
+            let mut raw = std::ptr::null_mut();
+            if unsafe { GetAce(acl, i as u32, &mut raw) } == 0 || raw.is_null() {
+                return Err(native("scm_acl_query_failed"));
+            }
+            let header = unsafe { &*(raw as *const ACE_HEADER) };
+            if header.AceFlags & 8 != 0 {
+                continue;
+            } // INHERIT_ONLY_ACE has no current-object rights.
+            if !matches!(header.AceType, 0 | 1) || header.AceSize < 16 {
+                return Err(error("scm_acl_rejected"));
+            }
+            let ace = unsafe { &*(raw as *const ACCESS_ALLOWED_ACE) };
+            let sid = std::ptr::addr_of!(ace.SidStart) as PSID;
+            if unsafe { IsValidSid(sid) } == 0
+                || 8 + unsafe { GetLengthSid(sid) } > header.AceSize as u32
+            {
+                return Err(error("scm_acl_rejected"));
+            }
+            if header.AceType == 0 && ace.Mask & write_mask != 0 && !trusted(&sid_text(sid)?) {
+                return Err(error("scm_acl_rejected"));
+            }
+        }
+        Ok(())
+    }
+    fn protected_boundary(host: &Path) -> Result<(), LaunchError> {
+        let version = host.parent().ok_or_else(|| error("scm_path_rejected"))?;
+        if host.file_name() != Some(OsStr::new(HOST_FILE))
+            || version.parent() != Some(Path::new(PROTECTED_RELEASES))
+        {
+            return Err(error("scm_path_rejected"));
+        }
+        validate_root_v2(version).map_err(|e| error(e.code()))?;
+        for p in version.ancestors() {
+            no_reparse(p).map_err(|e| error(e.code()))?;
+            protected_acl(
+                p,
+                p == Path::new(r"C:\") || p == Path::new(r"C:\Program Files"),
+            )?;
+        }
+        fn walk(path: &Path, depth: usize, count: &mut usize) -> Result<(), LaunchError> {
+            *count += 1;
+            if depth > 8 || *count > 32 {
+                return Err(error("scm_layout_rejected"));
+            }
+            let info = no_reparse(path).map_err(|e| error(e.code()))?;
+            protected_acl(path, false)?;
+            if info.is_dir() {
+                for entry in fs::read_dir(path).map_err(|_| native("scm_directory_read_failed"))? {
+                    walk(
+                        &entry
+                            .map_err(|_| native("scm_directory_read_failed"))?
+                            .path(),
+                        depth + 1,
+                        count,
+                    )?;
+                }
+            } else {
+                no_extra_streams_v2(path).map_err(|e| error(e.code()))?;
+            }
+            Ok(())
+        }
+        walk(version, 0, &mut 0)
+    }
+    fn request_from_candidate(
+        host: &Path,
+        cancel: CancelToken,
+    ) -> Result<LaunchRequest, LaunchError> {
+        let (manifest, record_digest) = read_candidate(host)?;
+
+        let root = host.parent().unwrap().join("ipc-fixture");
+        Ok(LaunchRequest {
+            target: LaunchTarget::ScmIpc(ScmIpcAuthorization {
+                record_digest,
+                #[cfg(test)]
+                offline: false,
+            }),
+            executable: root.join(STANDALONE_IPC_ENTRY),
+            working_directory: root.join("work"),
+            release_root: root,
+            manifest,
+            entry: SYNTHETIC_ENTRY.into(),
+            arguments: vec![],
+            environment_overrides: vec![],
+            timeout: Duration::from_secs(5),
+            cancel,
+        })
+    }
+    pub(super) fn scm_request(cancel: CancelToken) -> Result<Option<LaunchRequest>, LaunchError> {
+        let host = std::env::current_exe().map_err(|_| native("scm_host_rejected"))?;
+        let path = host
+            .parent()
+            .ok_or_else(|| error("scm_path_rejected"))?
+            .join(AUTH_FILE);
+        match fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(native("scm_authorization_read_failed")),
+            Ok(_) => {}
+        }
+        protected_boundary(&host)?;
+        request_from_candidate(&host, cancel).map(Some)
+    }
+    fn verify_scm_request(
+        request: &LaunchRequest,
+        proof: ScmIpcAuthorization,
+    ) -> Result<(), LaunchError> {
+        let version = request
+            .release_root
+            .parent()
+            .ok_or_else(|| error("scm_path_rejected"))?;
+        if request.release_root.file_name() != Some(OsStr::new("ipc-fixture")) {
+            return Err(error("scm_path_rejected"));
+        }
+        let host = version.join(HOST_FILE);
+        #[cfg(test)]
+        let offline = proof.offline;
+        #[cfg(not(test))]
+        let offline = false;
+        if !offline {
+            if std::env::current_exe().map_err(|_| native("scm_host_rejected"))? != host {
+                return Err(error("scm_host_rejected"));
+            }
+            protected_boundary(&host)?;
+        }
+        let (manifest, hash) = read_candidate(&host)?;
+        if hash != proof.record_digest || manifest != request.manifest {
+            return Err(error("scm_authorization_changed"));
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(super) fn offline_candidate(
+        host: &Path,
+        cancel: CancelToken,
+    ) -> Result<LaunchRequest, LaunchError> {
+        let mut request = request_from_candidate(host, cancel)?;
+        if let LaunchTarget::ScmIpc(ref mut proof) = request.target {
+            proof.offline = true;
+        }
+        Ok(request)
+    }
+
     fn validate(request: &LaunchRequest) -> Result<SyntheticCase, LaunchError> {
-        let standalone = matches!(request.target, LaunchTarget::StandaloneIpc);
+        let standalone = matches!(
+            request.target,
+            LaunchTarget::StandaloneIpc | LaunchTarget::ScmIpc(_)
+        );
+        let scm = matches!(request.target, LaunchTarget::ScmIpc(_));
+        if let LaunchTarget::ScmIpc(proof) = request.target {
+            verify_scm_request(request, proof)?;
+        }
         let ipc = matches!(
             request.target,
-            LaunchTarget::SyntheticIpc | LaunchTarget::StandaloneIpc
+            LaunchTarget::SyntheticIpc | LaunchTarget::StandaloneIpc | LaunchTarget::ScmIpc(_)
         );
         let case = match request.target {
             LaunchTarget::Synthetic(c) => c,
-            LaunchTarget::SyntheticIpc | LaunchTarget::StandaloneIpc => SyntheticCase::Wait,
+            LaunchTarget::SyntheticIpc | LaunchTarget::StandaloneIpc | LaunchTarget::ScmIpc(_) => {
+                SyntheticCase::Wait
+            }
             _ => return Err(error("gateway_release_not_qualified")),
         };
         let executable = if ipc {
@@ -825,7 +1190,7 @@ mod windows {
                 != request.release_root.join("work").as_os_str()
             || request.timeout < Duration::from_millis(10)
             || request.timeout > Duration::from_secs(5)
-            || request.release_root.parent() != Some(std::env::temp_dir().as_path())
+            || (!scm && request.release_root.parent() != Some(std::env::temp_dir().as_path()))
         {
             return Err(error("launch_policy_rejected"));
         }
@@ -864,14 +1229,14 @@ mod windows {
             &request.release_root.join(SYNTHETIC_ENTRY),
             SYNTHETIC_ENTRY_SOURCE.as_bytes(),
         )?;
-        if standalone {
+        if standalone && !scm {
             // V2 covers the actual copy; compare its bounded raw bytes with the
             // independently located fixed Cargo bin, never a caller-supplied hash.
             let source = standalone_build_artifact()?;
             if hash_tool(&source)? != hash_tool(&executable)? {
                 return Err(error("standalone_ipc_identity_mismatch"));
             }
-        } else if ipc {
+        } else if ipc && !scm {
             // This is a closed test-harness entry, not an executable supplied by
             // the caller. The only accepted copy is the current integration-test
             // image, byte-for-byte, in the V2-validated candidate tree. These
@@ -1293,7 +1658,7 @@ mod windows {
     ) -> Result<LaunchReport, LaunchError> {
         if matches!(
             request.target,
-            LaunchTarget::SyntheticIpc | LaunchTarget::StandaloneIpc
+            LaunchTarget::SyntheticIpc | LaunchTarget::StandaloneIpc | LaunchTarget::ScmIpc(_)
         ) {
             return Err(error("ipc_worker_required"));
         }
@@ -1306,7 +1671,7 @@ mod windows {
     ) -> Result<LaunchReport, LaunchError> {
         if !matches!(
             request.target,
-            LaunchTarget::SyntheticIpc | LaunchTarget::StandaloneIpc
+            LaunchTarget::SyntheticIpc | LaunchTarget::StandaloneIpc | LaunchTarget::ScmIpc(_)
         ) || gate.len() > 2048
             || gate.is_empty()
         {
@@ -1339,7 +1704,10 @@ mod windows {
         let cmd = if ipc_gate.is_some() {
             ipc_command(
                 &request.release_root,
-                matches!(request.target, LaunchTarget::StandaloneIpc),
+                matches!(
+                    request.target,
+                    LaunchTarget::StandaloneIpc | LaunchTarget::ScmIpc(_)
+                ),
             )
         } else {
             command(&request.release_root, case)
@@ -1527,6 +1895,65 @@ mod windows {
                 timeout: Duration::from_millis(100),
                 cancel: CancelToken::new(),
             }
+        }
+
+        #[test]
+        fn scm_acl_policy_checks_real_windows_security_descriptors_without_mutation() {
+            use windows_sys::Win32::Security::{Authorization::*, *};
+            for (sddl, accepted) in [
+                ("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;BU)", true),
+                ("O:BUG:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)", false),
+                ("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GA;;;WD)", false),
+                ("O:BAG:BAD:P(A;;FA;;;SY)(A;;WD;;;BU)", false),
+                ("O:BAG:BAD:P(A;;FA;;;SY)(A;;WO;;;BU)", false),
+                ("O:BAG:BAD:P(A;;FA;;;SY)(A;;DC;;;BU)", false),
+                ("O:BAG:BAD:NO_ACCESS_CONTROL", false),
+            ] {
+                let text = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+                let mut sd = std::ptr::null_mut();
+                assert_ne!(
+                    unsafe {
+                        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                            text.as_ptr(),
+                            1,
+                            &mut sd,
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    0
+                );
+                let mut owner = std::ptr::null_mut();
+                let mut defaulted = 0;
+                let mut present = 0;
+                let mut acl = std::ptr::null_mut();
+                assert_ne!(
+                    unsafe { GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) },
+                    0
+                );
+                assert_ne!(
+                    unsafe {
+                        GetSecurityDescriptorDacl(sd, &mut present, &mut acl, &mut defaulted)
+                    },
+                    0
+                );
+                let result = protected_acl_descriptor(owner, acl, false);
+                unsafe {
+                    LocalFree(sd);
+                }
+                assert_eq!(result.is_ok(), accepted, "{sddl}");
+            }
+        }
+        #[test]
+        fn scm_acl_rejects_developer_owned_temporary_tree() {
+            let f = CoreFixture::new();
+            assert_eq!(
+                protected_acl(&f.0, false).unwrap_err().code(),
+                "scm_acl_rejected"
+            );
+            assert_eq!(
+                protected_boundary(&f.0.join(HOST_FILE)).unwrap_err().code(),
+                "scm_path_rejected"
+            );
         }
         #[test]
         fn startup_ack_rejects_missing_or_changed_process_facts() {

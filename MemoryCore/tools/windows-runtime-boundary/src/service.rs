@@ -1236,6 +1236,34 @@ pub fn run_synthetic_ipc_lifecycle(
         ipc: s.ipc.take(),
     })
 }
+// Invalid authorization never downgrades to idle. Preserve the original native error.
+fn run_scm_engine(
+    sink: &mut impl StatusSink,
+    control: Arc<Control>,
+    selection: Result<Option<LaunchRequest>, launch::LaunchError>,
+) -> Result<SyntheticServiceReport, ServiceError> {
+    match selection {
+        Ok(None) => run_engine(sink, control, None),
+        Ok(Some(request)) => {
+            let state = Arc::new(Mutex::new(ProcessState {
+                ipc_case: Some(SyntheticIpcCase::Authenticate),
+                ipc: Some(SyntheticIpcReport::default()),
+                ..Default::default()
+            }));
+            run_engine_with_process(sink, control, None, Some((request, state)))
+        }
+        Err(error) => {
+            let _cleanup = EngineCleanup(control);
+            let mut machine = ServiceMachine::new();
+            let original = launch_failure(error);
+            let _ = machine.start(sink);
+            machine.failed = true;
+            let _ = machine.begin_stop(sink);
+            let _ = machine.finish_stop(sink, true);
+            Err(original)
+        }
+    }
+}
 struct NativeSink(SERVICE_STATUS_HANDLE);
 impl StatusSink for NativeSink {
     fn report(&mut self, snapshot: ServiceSnapshot) -> Result<(), ServiceError> {
@@ -1341,7 +1369,9 @@ unsafe extern "system" fn service_main(argc: u32, argv: *mut *mut u16) {
             save_host_error(ServiceError::native("service_handler_registration_failed"));
             return;
         }
-        if let Err(e) = run_engine(&mut NativeSink(status), state, None) {
+        // No argument/environment-selected release. Absence alone preserves legacy idle.
+        let selected = launch::scm_ipc_request(CancelToken::new());
+        if let Err(e) = run_scm_engine(&mut NativeSink(status), state, selected) {
             save_host_error(e);
         }
         drop(cleanup);
@@ -1958,6 +1988,221 @@ mod r4b_tests {
         }
     }
 
+    fn phases(t: &Trace) -> Vec<ServicePhase> {
+        t.states.lock().unwrap().clone()
+    }
+    fn authorized_fixture(f: &RaceFixture) -> LaunchRequest {
+        let bin = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("cmg-runtime-boundary-ipc-child.exe");
+        let child = fs::read(bin).unwrap();
+        let host = fs::read(std::env::current_exe().unwrap()).unwrap();
+        let mut manifest = f.manifest.clone();
+        manifest["files"].as_array_mut().unwrap().push(json!({"path":"app/cmg-runtime-boundary-ipc-child.exe","kind":"resource","size":child.len(),"sha256":hash(&child)}));
+        manifest["files"]
+            .as_array_mut()
+            .unwrap()
+            .sort_by_key(|v| v["path"].as_str().unwrap().to_owned());
+        let raw = serde_json::to_vec(&manifest).unwrap();
+        let id = format!(
+            "ipc-{}",
+            hash(format!("{}{}{}", hash(&host), hash(&child), hash(&raw)).as_bytes())
+        );
+        let version = f.root.join(&id);
+        let tree = version.join("ipc-fixture");
+        for d in ["app/src/gateway", "temp", "work"] {
+            fs::create_dir_all(tree.join(d)).unwrap();
+        }
+        for p in [
+            "app/package.json",
+            SYNTHETIC_ENTRY,
+            "closure-report.json",
+            "js-dependency-graph.json",
+        ] {
+            fs::copy(f.root.join(p), tree.join(p)).unwrap();
+        }
+        fs::write(tree.join("app/cmg-runtime-boundary-ipc-child.exe"), &child).unwrap();
+        fs::write(version.join("ipc-manifest-v2.json"), &raw).unwrap();
+        let hostpath = version.join("cmg-runtime-boundary-test-service.exe");
+        fs::write(&hostpath, &host).unwrap();
+        fs::write(version.join("ipc-start-authorization.json"),serde_json::to_vec(&json!({"schema_version":1,"purpose":"cmg-fixed-ipc-test-start","service_name":TEST_SERVICE_NAME,"artifact_id":id,"host_sha256":hash(&host),"child_sha256":hash(&child),"manifest_sha256":hash(&raw)})).unwrap()).unwrap();
+        launch::offline_scm_candidate(&hostpath, CancelToken::new()).unwrap()
+    }
+    #[test]
+    fn scm_authorized_candidate_reuses_engine_receipt_and_cleanup() {
+        let f = RaceFixture::new();
+        let request = authorized_fixture(&f);
+        let control = SyntheticProcessControl::new();
+        let trace = Trace::default();
+        let mut output = sink(&trace);
+        // The sink accepts STOP immediately after the real authentication receipt.
+        struct StopSink<'a>(&'a mut Sink, mpsc::SyncSender<()>);
+        impl StatusSink for StopSink<'_> {
+            fn report(&mut self, s: ServiceSnapshot) -> Result<(), ServiceError> {
+                self.0.report(s)?;
+                if s.phase == ServicePhase::Running {
+                    self.1.send(()).unwrap();
+                }
+                Ok(())
+            }
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        let stop_control = control.inner.clone();
+        let stopper = thread::spawn(move || {
+            rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            stop_control.request_stop().unwrap();
+        });
+        let mut output = StopSink(&mut output, tx);
+        let result = run_scm_engine(&mut output, control.inner.clone(), Ok(Some(request))).unwrap();
+        stopper.join().unwrap();
+        assert!(
+            result.prepared_before_running && result.worker_joined && result.resources_released
+        );
+        assert_eq!(
+            phases(&trace)
+                .iter()
+                .filter(|s| **s == ServicePhase::Running)
+                .count(),
+            1
+        );
+        assert_eq!(
+            phases(&trace)
+                .iter()
+                .filter(|s| **s == ServicePhase::Stopped)
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn scm_invalid_authorization_never_runs_or_falls_back_to_idle() {
+        let trace = Trace::default();
+        let mut output = sink(&trace);
+        let control = Arc::new(Control::new());
+        let error = run_scm_engine(
+            &mut output,
+            control,
+            Err(launch::error("scm_authorization_invalid")),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "scm_authorization_invalid");
+        assert_eq!(
+            phases(&trace),
+            vec![
+                ServicePhase::StartPending,
+                ServicePhase::StopPending,
+                ServicePhase::Stopped
+            ]
+        );
+    }
+    #[test]
+    fn scm_authorized_candidate_stop_before_spawn_has_no_late_running() {
+        let f = RaceFixture::new();
+        let request = authorized_fixture(&f);
+        let control = Arc::new(Control::new());
+        control.request_stop().unwrap();
+        let trace = Trace::default();
+        let mut output = sink(&trace);
+        let report = run_scm_engine(&mut output, control, Ok(Some(request))).unwrap();
+        assert!(report.worker_joined && report.resources_released);
+        assert!(!phases(&trace).contains(&ServicePhase::Running));
+    }
+
+    #[test]
+    fn scm_authorized_challenge_wait_cancel_reclaims_real_ipc_and_job() {
+        let f = RaceFixture::new();
+        let request = authorized_fixture(&f);
+        let control = Arc::new(Control::new());
+        let c = control.clone();
+        let state = Arc::new(Mutex::new(ProcessState {
+            ipc_case: Some(SyntheticIpcCase::ChallengeWait),
+            ipc: Some(SyntheticIpcReport::default()),
+            ..Default::default()
+        }));
+        let trace = Trace::default();
+        let mut output = sink(&trace);
+        let stopper = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while c.ipc_stage.load(Ordering::SeqCst) != 2 {
+                assert!(Instant::now() < deadline, "bounded real challenge wait");
+                thread::sleep(Duration::from_millis(5));
+            }
+            c.request_stop().unwrap();
+            c.request_stop().unwrap();
+        });
+        let result =
+            run_engine_with_process(&mut output, control, None, Some((request, state.clone())))
+                .unwrap();
+        stopper.join().unwrap();
+        let state = state.lock().unwrap();
+        let ipc = state.ipc.as_ref().unwrap();
+        let report = state.report.as_ref().unwrap();
+        assert!(ipc.cancellation_observed && !ipc.authenticated && ipc.pipe_released_before_job);
+        assert!(report.process_reaped && report.job_closed && report.output_readers_joined);
+        assert!(result.worker_joined && result.resources_released);
+        assert!(!phases(&trace).contains(&ServicePhase::Running));
+        assert_closed(&trace);
+    }
+    #[test]
+    fn scm_authorized_request_mutation_and_changed_record_are_rejected_before_running() {
+        for mutation in ["argument", "environment", "record", "child"] {
+            let f = RaceFixture::new();
+            let mut request = authorized_fixture(&f);
+            match mutation {
+                "argument" => request.arguments.push("--gateway".into()),
+                "environment" => request
+                    .environment_overrides
+                    .push(("PATH".into(), "unapproved".into())),
+                "record" => {
+                    fs::write(
+                        request
+                            .release_root
+                            .parent()
+                            .unwrap()
+                            .join("ipc-start-authorization.json"),
+                        b"{}",
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    fs::write(&request.executable, b"changed after validation").unwrap();
+                }
+            }
+            let trace = Trace::default();
+            let mut output = sink(&trace);
+            assert!(
+                run_scm_engine(&mut output, Arc::new(Control::new()), Ok(Some(request))).is_err()
+            );
+            assert!(!phases(&trace).contains(&ServicePhase::Running));
+            assert_closed(&trace);
+        }
+    }
+    #[test]
+    fn scm_missing_authorization_retains_idle_and_native_failure_is_preserved() {
+        assert!(launch::scm_ipc_request(CancelToken::new())
+            .unwrap()
+            .is_none());
+        let control = Arc::new(Control::new());
+        control.request_stop().unwrap();
+        let trace = Trace::default();
+        let mut output = sink(&trace);
+        assert!(
+            run_scm_engine(&mut output, control, Ok(None))
+                .unwrap()
+                .resources_released
+        );
+        assert_closed(&trace);
+        let trace = Trace::default();
+        let mut output = sink(&trace);
+        let mut error = launch::error("scm_acl_query_failed");
+        error.os_error = Some(5);
+        let error = run_scm_engine(&mut output, Arc::new(Control::new()), Err(error)).unwrap_err();
+        assert_eq!(error.native_code, Some(5));
+        assert!(!phases(&trace).contains(&ServicePhase::Running));
+    }
     fn process_schedule(name: &str) {
         let fixture = RaceFixture::new();
         let control = SyntheticProcessControl::new();

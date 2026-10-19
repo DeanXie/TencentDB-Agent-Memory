@@ -92,6 +92,53 @@ fn reject(r: LaunchRequest, code: &str) {
     assert_eq!(launch_synthetic(r).unwrap_err().code(), code);
 }
 
+fn scm_bundle(f: &Fixture) -> PathBuf {
+    let host = fs::read(env!("CARGO_BIN_EXE_cmg-runtime-boundary-test-service")).unwrap();
+    let child = fs::read(env!("CARGO_BIN_EXE_cmg-runtime-boundary-ipc-child")).unwrap();
+    let mut manifest = f.manifest.clone();
+    manifest["files"].as_array_mut().unwrap().push(json!({
+        "path":"app/cmg-runtime-boundary-ipc-child.exe", "kind":"resource",
+        "size":child.len(), "sha256":hash(&child)
+    }));
+    manifest["files"]
+        .as_array_mut()
+        .unwrap()
+        .sort_by_key(|v| v["path"].as_str().unwrap().to_owned());
+    let manifest = serde_json::to_vec(&manifest).unwrap();
+    let artifact = format!(
+        "ipc-{}",
+        hash(format!("{}{}{}", hash(&host), hash(&child), hash(&manifest)).as_bytes())
+    );
+    let version = f.root.join(&artifact);
+    let tree = version.join("ipc-fixture");
+    for dir in ["app/src/gateway", "temp", "work"] {
+        fs::create_dir_all(tree.join(dir)).unwrap();
+    }
+    for path in [
+        "app/package.json",
+        SYNTHETIC_ENTRY,
+        "closure-report.json",
+        "js-dependency-graph.json",
+    ] {
+        fs::copy(f.root.join(path), tree.join(path)).unwrap();
+    }
+    fs::write(tree.join("app/cmg-runtime-boundary-ipc-child.exe"), &child).unwrap();
+    fs::write(version.join("ipc-manifest-v2.json"), &manifest).unwrap();
+    let host_path = version.join("cmg-runtime-boundary-test-service.exe");
+    fs::write(&host_path, &host).unwrap();
+    fs::write(version.join("ipc-start-authorization.json"),serde_json::to_vec(&json!({
+        "schema_version":1,"purpose":"cmg-fixed-ipc-test-start", "service_name":"CmgRuntimeBoundaryR4ATest",
+        "host_sha256":hash(&host),"child_sha256":hash(&child),"manifest_sha256":hash(&manifest),"artifact_id":artifact
+    })).unwrap()).unwrap();
+    host_path
+}
+#[test]
+fn scm_authorization_accepts_exact_fixed_candidate_content_without_granting_trust() {
+    let f = Fixture::new();
+    let host = scm_bundle(&f);
+    LaunchRequest::inspect_scm_ipc_candidate(&host).unwrap();
+}
+
 #[test]
 fn ipc_fixture_cannot_be_launched_without_the_r4_ipc_worker() {
     let f = Fixture::new();
@@ -817,4 +864,86 @@ fn restrictive_parent_job_fails_closed_without_breakaway() {
     {
         println!("{line}");
     }
+}
+
+#[test]
+fn scm_authorization_rejects_invalid_record_content_and_unknown_files() {
+    for change in [
+        "purpose",
+        "host",
+        "child",
+        "manifest",
+        "extra-field",
+        "duplicate",
+        "extra-file",
+        "missing",
+    ] {
+        let f = Fixture::new();
+        let host = scm_bundle(&f);
+        let dir = host.parent().unwrap();
+        let record = dir.join("ipc-start-authorization.json");
+        let mut auth: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        match change {
+            "purpose" => auth["purpose"] = json!("gateway"),
+            "host" => {
+                fs::write(&host, b"changed").unwrap();
+            }
+            "child" => {
+                fs::write(
+                    dir.join("ipc-fixture/app/cmg-runtime-boundary-ipc-child.exe"),
+                    b"changed",
+                )
+                .unwrap();
+            }
+            "manifest" => {
+                fs::write(dir.join("ipc-manifest-v2.json"), b"{}").unwrap();
+            }
+            "extra-field" => auth["exe"] = json!("cmd.exe"),
+            "extra-file" => {
+                fs::write(dir.join("unapproved.exe"), b"extra").unwrap();
+            }
+            "missing" => {
+                fs::remove_file(dir.join("ipc-fixture/app/cmg-runtime-boundary-ipc-child.exe"))
+                    .unwrap();
+            }
+            _ => {}
+        }
+        if change == "duplicate" {
+            let raw = serde_json::to_string(&auth).unwrap();
+            fs::write(&record, raw.replacen('{', "{\"schema_version\":1,", 1)).unwrap();
+        } else {
+            fs::write(&record, serde_json::to_vec(&auth).unwrap()).unwrap();
+        }
+        assert!(
+            LaunchRequest::inspect_scm_ipc_candidate(&host).is_err(),
+            "{change}"
+        );
+    }
+}
+#[test]
+fn scm_authorization_rejects_junction_and_path_aliases() {
+    let f = Fixture::new();
+    let host = scm_bundle(&f);
+    let alias = f.root.join("alias");
+    let status = Command::new(r"C:\Windows\System32\cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&alias)
+        .arg(host.parent().unwrap())
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "junction fixture creation failed");
+    assert!(
+        LaunchRequest::inspect_scm_ipc_candidate(&alias.join(host.file_name().unwrap())).is_err()
+    );
+    fs::remove_dir(&alias).unwrap();
+    let dotted = PathBuf::from(format!("{}.", host.parent().unwrap().display()))
+        .join(host.file_name().unwrap());
+    assert!(LaunchRequest::inspect_scm_ipc_candidate(&dotted).is_err());
+}
+#[test]
+#[ignore = "requires this task's independently prepared candidate; content check only"]
+fn scm_authorization_reads_prepared_package_with_rust_v2() {
+    let host =
+        std::env::var_os("SCM_CONTENT_CANDIDATE").expect("explicit test-only candidate path");
+    LaunchRequest::inspect_scm_ipc_candidate(&PathBuf::from(host)).unwrap();
 }

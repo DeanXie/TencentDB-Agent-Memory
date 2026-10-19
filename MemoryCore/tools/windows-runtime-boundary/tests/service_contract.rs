@@ -1438,3 +1438,21 @@ fn process_worker_failed_instance_does_not_poison_next_request() {
     .unwrap();
     assert!(good.lifecycle.worker_joined && good.launch.unwrap().output_readers_joined);
 }
+
+#[test]
+fn scm_development_artifact_environment_and_arguments_cannot_authorize_launch() {
+    let exe = env!("CARGO_BIN_EXE_cmg-runtime-boundary-test-service");
+    let result = Command::new(exe)
+        .env(
+            "SCM_IPC_EXE",
+            env!("CARGO_BIN_EXE_cmg-runtime-boundary-ipc-child"),
+        )
+        .env("SCM_IPC_AUTHORIZED", "true")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("scm_dispatcher_unavailable"));
+    let result = Command::new(exe).arg("--ipc").output().unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("command_line_rejected"));
+}

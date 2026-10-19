@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory)][string]$TaskRoot,
     [Parameter(Mandatory)][string]$FixtureBinary,
-    [Parameter(Mandatory)][string]$FixtureSHA256
+    [Parameter(Mandatory)][string]$FixtureSHA256,
+    [switch]$FixedIpcOnly
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -30,6 +31,7 @@ if ((Get-FileHash -LiteralPath $FixtureBinary -Algorithm SHA256).Hash.ToLowerInv
 $size = $fixture.Length
 $work = Join-Path $TaskRoot ('tests-' + [guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($work)
+if (-not $FixedIpcOnly) {
 Case 'real offline-built test service binary is accepted' {
     Api Assert-R4CBinary
     $id = Assert-R4CBinary $FixtureBinary $FixtureSHA256 $size
@@ -304,6 +306,72 @@ Case 'preparation invokes no service writes and rollback is exact and confirmed'
     }
     $collision = Get-R4CCollisionState (New-R4CInstallationContract $FixtureSHA256 $size)
     Check ($collision.serviceAbsent -and $collision.targetAbsent) 'still_not_installed'
+}
+}
+if ($FixedIpcOnly) {
+    Case 'historical R4C frozen source cohort remains fail closed' {
+        Reject { Get-R4CSourceIdentities } 'source_head_mismatch'
+        $old=New-R4CInstallationContract $FixtureSHA256 $size
+        Check ($old.schema -ceq 'cmg-r4c-test-installation-v1' -and -not $old.installationApproved) 'old_contract'
+        Check ($old.artifactId -ceq ('r4c-'+$FixtureSHA256)) 'old_layout'
+    }
+    Case 'fixed IPC preparation compiles and copies two real Cargo bins' {
+        $script:ipcRun=Join-Path $work 'ipc-preparation'; [void][IO.Directory]::CreateDirectory($script:ipcRun)
+        $script:ipcPrepared=Invoke-FixedIpcPreparation -TaskRoot $script:ipcRun
+        Check ($script:ipcPrepared.status -ceq 'PASS_NONPRODUCTION' -and $script:ipcPrepared.fileCount -eq 8) 'actual_package'
+        $null=Assert-FixedIpcCandidate $script:ipcPrepared.candidateDirectory
+        Check (-not $script:ipcPrepared.installationPerformed -and -not $script:ipcPrepared.productionEligible) 'no_authority_upgrade'
+        Check (-not (Test-Path -LiteralPath (Join-Path $script:ipcRun '.incomplete'))) 'complete_marker'
+    }
+    Case 'fixed IPC package source and copied binary identities match' {
+        $d=$script:ipcPrepared.candidateDirectory
+        foreach($pair in @(@($script:ipcPrepared.host,'cmg-runtime-boundary-test-service.exe'),@($script:ipcPrepared.child,'ipc-fixture/app/cmg-runtime-boundary-ipc-child.exe'))){
+            Check ((Get-R4CFileIdentity (Join-Path $d $pair[1])).sha256 -ceq $pair[0].sha256) 'copy_identity'
+        }
+        $inventory=Get-Content -LiteralPath (Join-Path $script:ipcRun 'package-files.json') -Raw|ConvertFrom-Json
+        Check ($inventory.Count -eq 8) 'inventory'
+    }
+    Case 'fixed IPC profile rejects arbitrary binary service and output overrides' {
+        Reject { Invoke-FixedIpcPreparation -TaskRoot $work -Executable 'cmd.exe' } 'parameter'
+        Reject { Invoke-FixedIpcPreparation -TaskRoot $work -ServiceName 'Other' } 'parameter'
+        Reject { Invoke-FixedIpcPreparation -TaskRoot $script:ipcRun } 'output_collision'
+        Reject { Invoke-FixedIpcPreparation -TaskRoot 'C:\Program Files' } 'output_outside_temporary_area'
+    }
+    Case 'fixed IPC candidate detects executable mutation and undeclared files' {
+        $d=$script:ipcPrepared.candidateDirectory
+        $exe=Join-Path $d 'ipc-fixture/app/cmg-runtime-boundary-ipc-child.exe'
+        $original=[IO.File]::ReadAllBytes($exe)
+        try {[IO.File]::WriteAllText($exe,'tampered'); Reject {Assert-FixedIpcCandidate $d} 'ipc_identity_mismatch'}
+        finally {[IO.File]::WriteAllBytes($exe,$original)}
+        $extra=Join-Path $d 'extra.exe'
+        try {[IO.File]::WriteAllText($extra,'unapproved'); Reject {Assert-FixedIpcCandidate $d} 'ipc_extra_file'}
+        finally {[IO.File]::Delete($extra)}
+    }
+    Case 'fixed IPC authorization rejects unknown fields and duplicate keys' {
+        $d=$script:ipcPrepared.candidateDirectory; $p=Join-Path $d 'ipc-start-authorization.json'; $original=[IO.File]::ReadAllBytes($p)
+        try {
+            $a=Get-Content -LiteralPath $p -Raw|ConvertFrom-Json; $a|Add-Member -NotePropertyName exe -NotePropertyValue 'cmd.exe'
+            [IO.File]::WriteAllText($p,($a|ConvertTo-Json)); Reject {Assert-FixedIpcCandidate $d} 'ipc_authorization_invalid'
+            $text=[Text.Encoding]::UTF8.GetString($original); [IO.File]::WriteAllText($p,$text.Replace('{','{"schema_version":1,'))
+            Reject {Assert-FixedIpcCandidate $d} 'ipc_authorization_invalid'
+        } finally {[IO.File]::WriteAllBytes($p,$original)}
+    }
+    Case 'fixed IPC package rejects actual junction path' {
+        $link=Join-Path $work 'ipc-junction'; [void](New-Item -ItemType Junction -Path $link -Target $script:ipcPrepared.candidateDirectory)
+        Reject {Assert-FixedIpcCandidate $link} 'reparse_rejected'
+        # Remove only this test-created junction, never the target.
+        [IO.Directory]::Delete($link)
+    }
+    Case 'fixed IPC installation contract remains inert and separately authorized' {
+        $c=Get-Content -LiteralPath (Join-Path $script:ipcRun 'installation-contract.json') -Raw|ConvertFrom-Json
+        Check ($c.serviceName -ceq 'CmgRuntimeBoundaryR4ATest' -and $c.arguments.Count -eq 0) 'fixed_identity'
+        Check (-not $c.installationApproved -and -not $c.productionEligible) 'not_installed'
+        Check ($c.binaryPath -ceq ($c.targetDirectory+'\cmg-runtime-boundary-test-service.exe')) 'fixed_image'
+        Check ([IO.File]::ReadAllText((Join-Path $script:ipcRun 'ROLLBACK.md')).Contains($c.targetDirectory)) 'exact_rollback'
+        $ast=[Management.Automation.Language.Parser]::ParseFile($scriptPath,[ref]$null,[ref]$null)
+        $commands=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst]},$true)|ForEach-Object {$_.GetCommandName()})
+        foreach($name in @('Start-Service','Stop-Service','New-Service','Remove-Service','Set-Service','sc.exe','Start-Process','Invoke-Expression')) {Check ($commands -notcontains $name) 'no_service_execution'}
+    }
 }
 $fail = @($script:results | Where-Object status -eq 'FAIL').Count
 $summary = [ordered]@{tests=$script:results.Count;pass=$script:results.Count-$fail;fail=$fail;results=$script:results}

@@ -1,6 +1,6 @@
 # R4C: local, nonauthoritative test-package preparation. Never installs a service.
 [CmdletBinding()]
-param([switch]$LibraryOnly, [string]$TaskRoot)
+param([switch]$LibraryOnly, [string]$TaskRoot, [switch]$FixedIpc)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $script:R4CScriptPath = $PSCommandPath
@@ -735,7 +735,139 @@ Administrator concurrency and path TOCTOU remain; a mismatch always preserves ev
     Write-R4CText (Join-Path $root 'preparation-receipt.json') ($receipt | ConvertTo-Json -Depth 12)
     return $receipt
 }
+# Explicit IPC profile; the historical R4C functions and frozen cohort remain unchanged.
+function Get-FixedIpcHash([byte[]]$Bytes) {
+    $sha=[Security.Cryptography.SHA256]::Create()
+    try { [Convert]::ToHexString($sha.ComputeHash($Bytes)).ToLowerInvariant() } finally {$sha.Dispose()}
+}
+function Get-FixedIpcSources {
+    $head=& 'F:\Software\Git\cmd\git.exe' --no-optional-locks -C $script:R4CRepo rev-parse HEAD
+    if($LASTEXITCODE -ne 0 -or $head -cne '05640082d0c577ca2ec2304198dd4999aa920d24'){throw 'ipc_source_head_mismatch'}
+    $allowed=@('Cargo.toml','Cargo.lock','src/lib.rs','src/main.rs','src/launch.rs','src/peer.rs','src/service.rs','src/release.rs','src/release_v2.rs','src/bin/cmg-runtime-boundary-ipc-child.rs','tests/launch_contract.rs','tests/peer_contract.rs','tests/service_contract.rs','tests/release_contract.rs','tests/release_v2_contract.rs','scripts/prepare-test-deployment.ps1','tests/prepare-test-deployment.test.ps1')
+    foreach($f in Get-ChildItem $script:R4CCrate -Recurse -File -Force){
+        $rel=[IO.Path]::GetRelativePath($script:R4CCrate,$f.FullName).Replace('\','/')
+        if(($f.Extension -eq '.rs' -and $allowed -cnotcontains $rel) -or $f.Name -in @('build.rs','config','config.toml','rust-toolchain','rust-toolchain.toml')){throw 'ipc_unapproved_build_input'}
+    }
+    $ids=@(foreach($rel in $allowed){$id=Get-R4CFileIdentity (Join-Path $script:R4CCrate $rel); [ordered]@{path=$rel;size=$id.size;sha256=$id.sha256}})
+    if(($ids|Where-Object path -ceq 'Cargo.lock').sha256 -cne 'c62b425901d72b9355bcc5d41894c45ea8c546cebbb8168435aaedb611e1cde1'){throw 'ipc_lock_changed'}
+    return $ids
+}
+function Assert-FixedIpcCandidate {
+    [CmdletBinding()]param([Parameter(Mandatory)][string]$Directory)
+    $null=Assert-R4CPath $Directory
+    $authFile=Join-Path $Directory 'ipc-start-authorization.json'
+    if ((Get-R4CFileIdentity $authFile).size -gt 16384){throw 'ipc_authorization_invalid'}
+    $raw=[IO.File]::ReadAllBytes($authFile)
+    if($raw.Length -gt 16384){throw 'ipc_authorization_invalid'}
+    $doc=[Text.Json.JsonDocument]::Parse([Text.Encoding]::UTF8.GetString($raw))
+    try {
+        $names=@($doc.RootElement.EnumerateObject()|ForEach-Object Name|Sort-Object)
+        $expected=@('schema_version','purpose','service_name','host_sha256','child_sha256','manifest_sha256','artifact_id')|Sort-Object
+        if(($names -join ',') -cne ($expected -join ',')){throw 'ipc_authorization_invalid'}
+    } finally {$doc.Dispose()}
+    $a=[Text.Encoding]::UTF8.GetString($raw)|ConvertFrom-Json
+    if($a.schema_version -ne 1 -or $a.purpose -cne 'cmg-fixed-ipc-test-start' -or $a.service_name -cne 'CmgRuntimeBoundaryR4ATest'){throw 'ipc_authorization_invalid'}
+    foreach($h in @($a.host_sha256,$a.child_sha256,$a.manifest_sha256)){if($h -cnotmatch '^[0-9a-f]{64}$'){throw 'ipc_authorization_invalid'}}
+    $id='ipc-'+(Get-FixedIpcHash ([Text.Encoding]::ASCII.GetBytes($a.host_sha256+$a.child_sha256+$a.manifest_sha256)))
+    if($id -cne $a.artifact_id -or (Split-Path $Directory -Leaf) -cne $id){throw 'ipc_identity_mismatch'}
+    $hostPath=Join-Path $Directory 'cmg-runtime-boundary-test-service.exe'; $hostId=Get-R4CFileIdentity $hostPath
+    $null=Assert-R4CBinary $hostPath $a.host_sha256 $hostId.size
+    $mf=Join-Path $Directory 'ipc-manifest-v2.json'
+    if((Get-R4CFileIdentity $mf).sha256 -cne $a.manifest_sha256){throw 'ipc_identity_mismatch'}
+    $m=Get-Content -LiteralPath $mf -Raw|ConvertFrom-Json; $tree=Join-Path $Directory 'ipc-fixture'
+    $expected=@('app/package.json','app/src/gateway/server.js','app/cmg-runtime-boundary-ipc-child.exe','closure-report.json','js-dependency-graph.json')|Sort-Object
+    if($m.format_version -ne 2 -or $m.production_eligible -ne $false -or $m.files.Count -ne 5 -or
+        ((@($m.files|ForEach-Object path|Sort-Object)) -join ',') -cne ($expected -join ',')){throw 'ipc_manifest_invalid'}
+    if((@($m.directories) -join ',') -cne 'app,app/src,app/src/gateway,temp,work'){throw 'ipc_manifest_invalid'}
+    foreach($f in Get-ChildItem -LiteralPath $Directory -Recurse -Force){$null=Assert-R4CPath $f.FullName}
+    $actual=@(Get-ChildItem -LiteralPath $Directory -Force|ForEach-Object Name|Sort-Object)
+    if(($actual -join ',') -cne 'cmg-runtime-boundary-test-service.exe,ipc-fixture,ipc-manifest-v2.json,ipc-start-authorization.json'){throw 'ipc_extra_file'}
+    $actual=@(Get-ChildItem -LiteralPath $tree -Recurse -File|ForEach-Object {[IO.Path]::GetRelativePath($tree,$_.FullName).Replace('\','/')}|Sort-Object)
+    if(($actual -join ',') -cne ($expected -join ',')){throw 'ipc_extra_file'}
+    $actual=@(Get-ChildItem -LiteralPath $tree -Recurse -Directory|ForEach-Object {[IO.Path]::GetRelativePath($tree,$_.FullName).Replace('\','/')}|Sort-Object)
+    if(($actual -join ',') -cne ((@($m.directories)|Sort-Object) -join ',')){throw 'ipc_extra_directory'}
+    foreach($f in $m.files){$id=Get-R4CFileIdentity (Join-Path $tree $f.path); if($id.sha256 -cne $f.sha256 -or $id.size -ne $f.size){throw 'ipc_identity_mismatch'}}
+    if((Get-R4CFileIdentity (Join-Path $tree 'app/cmg-runtime-boundary-ipc-child.exe')).sha256 -cne $a.child_sha256){throw 'ipc_identity_mismatch'}
+    return $a
+}
+function Invoke-FixedIpcPreparation {
+    [CmdletBinding()]param([Parameter(Mandatory)][string]$TaskRoot)
+    if(-not $IsWindows -or -not [Environment]::Is64BitProcess){throw 'windows_x64_host_required'}
+    if(([Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'nonadministrator_required'}
+    $root=Assert-R4CPath $TaskRoot; $temp=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Temp'
+    if(-not $root.StartsWith($temp+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'output_outside_temporary_area'}
+    if(-not (Test-Path -LiteralPath $root -PathType Container)){throw 'task_directory_missing'}
+    if(@(Get-ChildItem -LiteralPath $root -Force).Count){throw 'output_collision'}
+    foreach($v in [Environment]::GetEnvironmentVariables().Keys){if($v -match '^(CARGO_|RUSTUP_|RUSTC|RUSTFLAGS$|CC$|CXX$|CL$|_CL_$|LINK$|_LINK_$|LIB$|LIBPATH$)'){throw "build_override_rejected:$v"}}
+    foreach($d in @($script:R4CCrate,(Split-Path $script:R4CCrate),(Split-Path (Split-Path $script:R4CCrate)),$script:R4CRepo,'F:\AI','F:\',(Join-Path $env:USERPROFILE '.cargo'))){foreach($n in @('.cargo\config','.cargo\config.toml','config','config.toml')){if(Test-Path -LiteralPath (Join-Path $d $n)){throw 'cargo_configuration_requires_review'}}}
+    $before=@(Get-FixedIpcSources)
+    $tools='C:\Users\DeanX\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin'
+    $cargo=Join-Path $tools 'cargo.exe'; $rustc=Join-Path $tools 'rustc.exe'
+    $msvc='C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207'; $linker=Join-Path $msvc 'bin\Hostx64\x64\link.exe'
+    $toolIds=@(foreach($t in @($cargo,$rustc,$linker)){Get-R4CFileIdentity $t})
+    $target=Join-Path $root 'cargo-target'; $scratch=Join-Path $root 'build-tmp'; [void][IO.Directory]::CreateDirectory($scratch)
+    $args=@('build','--offline','--locked','--manifest-path',(Join-Path $script:R4CCrate 'Cargo.toml'),'--target-dir',$target,'--bin','cmg-runtime-boundary-test-service','--bin','cmg-runtime-boundary-ipc-child')
+    $proc=[Diagnostics.Process]::new()
+    try {
+        $i=[Diagnostics.ProcessStartInfo]::new($cargo); $i.UseShellExecute=$false; $i.CreateNoWindow=$true; $i.WorkingDirectory=$script:R4CCrate
+        $i.RedirectStandardOutput=$true; $i.RedirectStandardError=$true; $i.Environment.Clear()
+        foreach($n in @('SystemRoot','WINDIR','USERPROFILE','LOCALAPPDATA','APPDATA')){$i.Environment[$n]=[Environment]::GetEnvironmentVariable($n)}
+        $i.Environment['PATH']=$tools+';'+(Split-Path $linker)+';C:\Windows\System32;C:\Windows'; $i.Environment['RUSTC']=$rustc
+        $i.Environment['CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER']=$linker
+        $i.Environment['LIB']=(Join-Path $msvc 'lib\x64')+';C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\ucrt\x64'
+        $i.Environment['TEMP']=$scratch; $i.Environment['TMP']=$scratch
+        foreach($a in $args){$i.ArgumentList.Add($a)}
+        $proc.StartInfo=$i; if(-not $proc.Start()){throw 'offline_build_not_started'}
+        $out=$proc.StandardOutput.ReadToEndAsync(); $err=$proc.StandardError.ReadToEndAsync(); $proc.WaitForExit(); $code=$proc.ExitCode
+        Write-R4CText (Join-Path $root 'cargo.stdout') $out.GetAwaiter().GetResult(); Write-R4CText (Join-Path $root 'cargo.stderr') $err.GetAwaiter().GetResult()
+    } finally {$proc.Dispose()}
+    Write-R4CText (Join-Path $root 'build-receipt.json') (@{executable=$cargo;arguments=$args;exitCode=$code;tools=$toolIds;cargoVersion=(& $cargo --version);rustcVersion=(& $rustc --version);sourceHead='05640082d0c577ca2ec2304198dd4999aa920d24';productionEligible=$false;externalRuntimeLoading='NOT_PROVEN'}|ConvertTo-Json -Depth 8)
+    if($code -ne 0){throw "offline_build_failed:$code"}
+    $after=@(Get-FixedIpcSources)
+    if(($before|ConvertTo-Json -Compress) -cne ($after|ConvertTo-Json -Compress)){throw 'source_changed_during_build'}
+    $hostSource=Join-Path $target 'debug\cmg-runtime-boundary-test-service.exe'; $childSource=Join-Path $target 'debug\cmg-runtime-boundary-ipc-child.exe'
+    $hostId=Get-R4CFileIdentity $hostSource; $childId=Get-R4CFileIdentity $childSource
+    $candidate=Join-Path $root 'candidate'; [void][IO.Directory]::CreateDirectory($candidate); $tree=Join-Path $candidate 'ipc-fixture'
+    foreach($d in @('app/src/gateway','temp','work')){[void][IO.Directory]::CreateDirectory((Join-Path $tree $d))}
+    Write-R4CText (Join-Path $root '.incomplete') 'Not a completed or authorized release.'
+    $source=[IO.File]::ReadAllText((Join-Path $script:R4CCrate 'src/launch.rs'))
+    $match=[regex]::Match($source,'(?s)pub const SYNTHETIC_ENTRY_SOURCE: &str = r#"(.*?)"#;')
+    if(-not $match.Success){throw 'fixed_fixture_source_missing'}
+    $utf8=[Text.UTF8Encoding]::new($false)
+    [IO.File]::WriteAllText((Join-Path $tree 'app/src/gateway/server.js'),$match.Groups[1].Value.Replace("`r`n","`n"),$utf8)
+    [IO.File]::WriteAllText((Join-Path $tree 'app/package.json'),"{`"type`":`"module`",`"private`":true}`n",$utf8)
+    Write-R4CText (Join-Path $tree 'js-dependency-graph.json') (@{format='gateway-js-dependency-staging/v1';edges=@(@{status='UNRESOLVED'});TRANSITIVE_CLOSURE_PROVEN=$false;NATIVE_LOAD_VERIFIED=$false;DEVELOPMENT_PATH_ESCAPE=$false}|ConvertTo-Json -Depth 8)
+    $graphHash=(Get-R4CFileIdentity (Join-Path $tree 'js-dependency-graph.json')).sha256
+    $node=@{version='v24.16.0';platform='win32';architecture='x64';moduleABI='137';napi='10';runtimeCompatibility='NOT_LOAD_VERIFIED'}
+    $build=@{name='esbuild';version='0.28.2';typescriptVersion='6.0.3';lockVersionMatched=$true;lockSha256=('1'*64);jsEntrypoints=@(@{path='node_modules/esbuild/lib/main.js';bytes=1;sha256=('2'*64)});executableIdentity=@{bytes=1;sha256=('3'*64)};transformCalls=1}
+    Write-R4CText (Join-Path $tree 'closure-report.json') (@{format='gateway-js-candidate-closure/v1';entryOutput='app/src/gateway/server.js';CANDIDATE_BUILD_SUCCESS=$true;buildExitCode=0;buildTool=$build;node=$node;jsDependencyStaging=@{graphPath='js-dependency-graph.json';graphSha256=$graphHash;unresolvedEdges=1;TRANSITIVE_CLOSURE_PROVEN=$false;NATIVE_LOAD_VERIFIED=$false;DEVELOPMENT_PATH_ESCAPE=$false};closureGateExitCode=2;RELEASE_ELIGIBLE=$false;RELEASE_DEPENDENCY_CLOSURE_COMPLETE=$false}|ConvertTo-Json -Depth 12)
+    [IO.File]::Copy($childSource,(Join-Path $tree 'app/cmg-runtime-boundary-ipc-child.exe'),$false)
+    $files=@(foreach($path in @('app/cmg-runtime-boundary-ipc-child.exe','app/package.json','app/src/gateway/server.js','closure-report.json','js-dependency-graph.json')){
+        $id=Get-R4CFileIdentity (Join-Path $tree $path); $kind=if($path -like '*.exe'){'resource'}elseif($path -eq 'app/package.json'){'metadata'}elseif($path -like '*.js'){'gateway-js'}else{'report'}
+        [ordered]@{path=$path;size=$id.size;sha256=$id.sha256;kind=$kind}
+    })
+    if(($files|Where-Object path -like '*.exe').sha256 -cne $childId.sha256){throw 'ipc_copy_identity_mismatch'}
+    $manifest=[ordered]@{format_version=2;platform='windows';architecture='x86_64';validation_scope='candidate-static-tree';production_eligible=$false;entry='app/src/gateway/server.js';node=$node;node_identity_scope='reported-target-not-packaged';build_tool=$build;closure=@{path='closure-report.json';sha256=(Get-R4CFileIdentity (Join-Path $tree 'closure-report.json')).sha256;graph_path='js-dependency-graph.json';graph_sha256=$graphHash;unresolved_edges=1};runtime=@{dependency_closure_proven=$false;native_load_verified=$false;config_isolation=$false;protected_service=$false;trusted_issuer=$false};directories=@('app','app/src','app/src/gateway','temp','work');files=$files}
+    Write-R4CText (Join-Path $candidate 'ipc-manifest-v2.json') ($manifest|ConvertTo-Json -Depth 16)
+    $mh=(Get-R4CFileIdentity (Join-Path $candidate 'ipc-manifest-v2.json')).sha256
+    $artifact='ipc-'+(Get-FixedIpcHash ([Text.Encoding]::ASCII.GetBytes($hostId.sha256+$childId.sha256+$mh)))
+    [IO.File]::Copy($hostSource,(Join-Path $candidate 'cmg-runtime-boundary-test-service.exe'),$false)
+    Write-R4CText (Join-Path $candidate 'ipc-start-authorization.json') (@{schema_version=1;purpose='cmg-fixed-ipc-test-start';service_name='CmgRuntimeBoundaryR4ATest';host_sha256=$hostId.sha256;child_sha256=$childId.sha256;manifest_sha256=$mh;artifact_id=$artifact}|ConvertTo-Json)
+    $final=Join-Path $root $artifact; [IO.Directory]::Move($candidate,$final); $null=Assert-FixedIpcCandidate $final
+    $targetDirectory='C:\Program Files\TencentDBAgentMemory-L4Test\releases\'+$artifact
+    Write-R4CText (Join-Path $root 'installation-contract.json') (@{schema='cmg-fixed-ipc-test-installation-v1';serviceName='CmgRuntimeBoundaryR4ATest';account='NT SERVICE\CmgRuntimeBoundaryR4ATest';serviceSidType='unrestricted';startMode='demand';arguments=@();recoveryActions=@();targetDirectory=$targetDirectory;binaryPath=$targetDirectory+'\cmg-runtime-boundary-test-service.exe';serviceDacl='D:P(A;;GA;;;SY)(A;;GA;;;BA)';directoryPolicy='SYSTEM/Administrators write; service SID RX only; owners/ancestors verified; no reparse/developer write';installationApproved=$false;installationPerformed=$false;productionEligible=$false;missingAuthorization='Legacy idle; record deletion not distinguishable at runtime';externalRuntimeLoading='NOT_PROVEN'}|ConvertTo-Json -Depth 10)
+    Write-R4CText (Join-Path $root 'INSTALLATION.md') "PLAN ONLY. Separate administrator approval and independent receipt acceptance required. Reuse R4C owner/ancestor/SCM protections, but NEVER its frozen one-file installer for this NEW layout. Publish ONLY the reviewed version tree at $targetDirectory. Verify every directory/file owner, DACL, reparse/rename/delete boundary and source/destination identity, including volume/root; SYSTEM/Administrators write, service SID RX only. Exact quoted host ImagePath, no arguments, fixed virtual account, manual own-process service, SYSTEM/Administrators service DACL, no recovery commands. Recheck all hashes and ACLs before start. Existing service requires separate exact update/rollback approval. No install commands are executed. Content hashes are not publisher authorization. MSVC DLL protected loading remains unproven. Synthetic V2 build metadata does not describe a real Gateway build."
+    Write-R4CText (Join-Path $root 'ROLLBACK.md') "PLAN ONLY; explicit separate approval required. Match CmgRuntimeBoundaryR4ATest, exact ImagePath, host/child/manifest/authorization identities and $targetDirectory to this receipt first. Only then stop/delete the approved test service and remove ONLY that version directory. Preserve evidence and base/releases parents; never touch another version or mismatching service. No automatic cleanup."
+    Write-R4CText (Join-Path $root 'source-identities.json') ($before|ConvertTo-Json -Depth 8)
+    $inventory=@(Get-ChildItem -LiteralPath $final -Recurse -File|ForEach-Object {$id=Get-R4CFileIdentity $_.FullName; [ordered]@{path=[IO.Path]::GetRelativePath($final,$_.FullName).Replace('\','/');size=$id.size;sha256=$id.sha256}}|Sort-Object path)
+    Write-R4CText (Join-Path $root 'package-files.json') ($inventory|ConvertTo-Json -Depth 8)
+    [IO.File]::Delete((Join-Path $root '.incomplete'))
+    $receipt=[ordered]@{schema='cmg-fixed-ipc-preparation-v1';status='PASS_NONPRODUCTION';candidateDirectory=$final;targetDirectory=$targetDirectory;artifactId=$artifact;host=$hostId;child=$childId;manifestSHA256=$mh;fileCount=$inventory.Count;packageIdentity=(Get-R4CFileIdentity (Join-Path $root 'package-files.json')).sha256;installationPerformed=$false;productionEligible=$false;aclAcceptance='NOT_EXECUTED';fixtureMetadata='SYNTHETIC_ONLY_NOT_A_GATEWAY_BUILD'}
+    Write-R4CText (Join-Path $root 'preparation-receipt.json') ($receipt|ConvertTo-Json -Depth 10)
+    return $receipt
+}
 if (-not $LibraryOnly) {
     if ([string]::IsNullOrEmpty($TaskRoot)) { throw 'task_root_required' }
-    Invoke-R4CPreparation -TaskRoot $TaskRoot | ConvertTo-Json -Depth 12
+    if ($FixedIpc) { Invoke-FixedIpcPreparation -TaskRoot $TaskRoot | ConvertTo-Json -Depth 12 }
+    else { Invoke-R4CPreparation -TaskRoot $TaskRoot | ConvertTo-Json -Depth 12 }
 }

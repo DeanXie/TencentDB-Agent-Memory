@@ -3,12 +3,14 @@ param(
     [Parameter(Mandatory)][string]$TaskRoot,
     [Parameter(Mandatory)][string]$FixtureBinary,
     [Parameter(Mandatory)][string]$FixtureSHA256,
-    [switch]$FixedIpcOnly
+    [switch]$FixedIpcOnly,
+    [switch]$SourceBindingOnly,
+    [string]$ApprovedSourceHead
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $scriptPath = Join-Path $PSScriptRoot '..\scripts\prepare-test-deployment.ps1'
-if (Test-Path -LiteralPath $scriptPath) { . $scriptPath -LibraryOnly -TaskRoot $TaskRoot }
+if (Test-Path -LiteralPath $scriptPath) { . $scriptPath -LibraryOnly -TaskRoot $TaskRoot -ApprovedSourceHead $ApprovedSourceHead }
 $script:results = [System.Collections.Generic.List[object]]::new()
 function Check([bool]$Value, [string]$Message) { if (-not $Value) { throw "assertion:$Message" } }
 function Api([string]$Name) {
@@ -31,7 +33,34 @@ if ((Get-FileHash -LiteralPath $FixtureBinary -Algorithm SHA256).Hash.ToLowerInv
 $size = $fixture.Length
 $work = Join-Path $TaskRoot ('tests-' + [guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($work)
-if (-not $FixedIpcOnly) {
+if ($SourceBindingOnly -or $FixedIpcOnly) {
+    Case 'fixed IPC accepts the explicitly approved current full source HEAD' {
+        $actual=& 'F:\Software\Git\cmd\git.exe' --no-optional-locks -C $script:R4CRepo rev-parse HEAD
+        Check ($LASTEXITCODE -eq 0 -and $actual -ceq $ApprovedSourceHead) 'approved_test_baseline'
+        Check ((Get-FixedIpcSourceHead -ApprovedSourceHead $ApprovedSourceHead) -ceq $actual) 'actual_full_head'
+        $sources=@(Get-FixedIpcSources -ApprovedSourceHead $ApprovedSourceHead)
+        Check ($sources.Count -eq 17) 'complete_source_identity_set'
+    }
+    Case 'fixed IPC rejects missing abbreviated symbolic and malformed approvals' {
+        Reject {Get-FixedIpcSources} 'ipc_approved_source_head_invalid'
+        foreach($invalid in @('', $ApprovedSourceHead.Substring(0,12), 'HEAD', 'refs/heads/feat/server_team',
+            $ApprovedSourceHead.ToUpperInvariant(), ($ApprovedSourceHead+"`n"), ('g'*40))) {
+            Reject {Get-FixedIpcSources -ApprovedSourceHead $invalid} 'ipc_approved_source_head_invalid'
+        }
+    }
+    Case 'fixed IPC rejects an exact full HEAD that is not current' {
+        foreach($wrong in @(('0'*40),'05640082d0c577ca2ec2304198dd4999aa920d24')) {
+            Reject {Get-FixedIpcSources -ApprovedSourceHead $wrong} 'ipc_source_head_mismatch'
+        }
+    }
+    Case 'missing or mismatched approval cannot start a build or create its outputs' {
+        $empty=Join-Path $work 'rejected-binding'; [void][IO.Directory]::CreateDirectory($empty)
+        Reject {Invoke-FixedIpcPreparation -TaskRoot $empty} 'ipc_approved_source_head_invalid'
+        Reject {Invoke-FixedIpcPreparation -TaskRoot $empty -ApprovedSourceHead ('0'*40)} 'ipc_source_head_mismatch'
+        Check (@(Get-ChildItem -LiteralPath $empty -Force).Count -eq 0) 'no_build_outputs'
+    }
+}
+if (-not $FixedIpcOnly -and -not $SourceBindingOnly) {
 Case 'real offline-built test service binary is accepted' {
     Api Assert-R4CBinary
     $id = Assert-R4CBinary $FixtureBinary $FixtureSHA256 $size
@@ -317,11 +346,26 @@ if ($FixedIpcOnly) {
     }
     Case 'fixed IPC preparation compiles and copies two real Cargo bins' {
         $script:ipcRun=Join-Path $work 'ipc-preparation'; [void][IO.Directory]::CreateDirectory($script:ipcRun)
-        $script:ipcPrepared=Invoke-FixedIpcPreparation -TaskRoot $script:ipcRun
+        $script:ipcPrepared=Invoke-FixedIpcPreparation -TaskRoot $script:ipcRun -ApprovedSourceHead $ApprovedSourceHead
         Check ($script:ipcPrepared.status -ceq 'PASS_NONPRODUCTION' -and $script:ipcPrepared.fileCount -eq 8) 'actual_package'
         $null=Assert-FixedIpcCandidate $script:ipcPrepared.candidateDirectory
         Check (-not $script:ipcPrepared.installationPerformed -and -not $script:ipcPrepared.productionEligible) 'no_authority_upgrade'
         Check (-not (Test-Path -LiteralPath (Join-Path $script:ipcRun '.incomplete'))) 'complete_marker'
+    }
+    Case 'build and preparation receipts bind actual HEAD and recorded worktree inputs' {
+        $build=Get-Content -LiteralPath (Join-Path $script:ipcRun 'build-receipt.json') -Raw|ConvertFrom-Json
+        foreach($receipt in @($build,$script:ipcPrepared)) {
+            Check ($receipt.sourceHead -ceq $ApprovedSourceHead -and $receipt.approvedSourceHead -ceq $ApprovedSourceHead) 'accurate_head_binding'
+            Check ($receipt.sourceIdentityScope -ceq 'APPROVED_HEAD_BASELINE_PLUS_RECORDED_WORKTREE_FILES') 'not_pristine_source_claim'
+            $actual=@(& 'F:\Software\Git\cmd\git.exe' --no-optional-locks -C $script:R4CRepo diff HEAD --name-only -- $script:R4CCrate)
+            Check ($LASTEXITCODE -eq 0 -and (@($receipt.sourceWorktreeChanges) -join ',') -ceq ($actual -join ',')) 'accurate_worktree_changes'
+        }
+        $sources=@(Get-Content -LiteralPath (Join-Path $script:ipcRun 'source-identities.json') -Raw|ConvertFrom-Json)
+        Check ($sources.Count -eq 17) 'source_count'
+        foreach($source in $sources) {
+            $actual=Get-R4CFileIdentity (Join-Path $script:R4CCrate $source.path)
+            Check ($actual.sha256 -ceq $source.sha256 -and $actual.size -eq $source.size) 'recorded_input_bytes'
+        }
     }
     Case 'fixed IPC package source and copied binary identities match' {
         $d=$script:ipcPrepared.candidateDirectory
@@ -334,8 +378,8 @@ if ($FixedIpcOnly) {
     Case 'fixed IPC profile rejects arbitrary binary service and output overrides' {
         Reject { Invoke-FixedIpcPreparation -TaskRoot $work -Executable 'cmd.exe' } 'parameter'
         Reject { Invoke-FixedIpcPreparation -TaskRoot $work -ServiceName 'Other' } 'parameter'
-        Reject { Invoke-FixedIpcPreparation -TaskRoot $script:ipcRun } 'output_collision'
-        Reject { Invoke-FixedIpcPreparation -TaskRoot 'C:\Program Files' } 'output_outside_temporary_area'
+        Reject { Invoke-FixedIpcPreparation -TaskRoot $script:ipcRun -ApprovedSourceHead $ApprovedSourceHead } 'output_collision'
+        Reject { Invoke-FixedIpcPreparation -TaskRoot 'C:\Program Files' -ApprovedSourceHead $ApprovedSourceHead } 'output_outside_temporary_area'
     }
     Case 'fixed IPC candidate detects executable mutation and undeclared files' {
         $d=$script:ipcPrepared.candidateDirectory

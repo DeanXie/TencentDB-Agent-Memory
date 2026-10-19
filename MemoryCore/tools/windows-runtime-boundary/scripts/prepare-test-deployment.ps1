@@ -1,6 +1,6 @@
 # R4C: local, nonauthoritative test-package preparation. Never installs a service.
 [CmdletBinding()]
-param([switch]$LibraryOnly, [string]$TaskRoot, [switch]$FixedIpc)
+param([switch]$LibraryOnly, [string]$TaskRoot, [switch]$FixedIpc, [string]$ApprovedSourceHead)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $script:R4CScriptPath = $PSCommandPath
@@ -740,9 +740,17 @@ function Get-FixedIpcHash([byte[]]$Bytes) {
     $sha=[Security.Cryptography.SHA256]::Create()
     try { [Convert]::ToHexString($sha.ComputeHash($Bytes)).ToLowerInvariant() } finally {$sha.Dispose()}
 }
+function Get-FixedIpcSourceHead {
+    param([string]$ApprovedSourceHead)
+    # Operator-approved baseline identity only, never publisher or runtime authority.
+    if($ApprovedSourceHead -cnotmatch '\A[0-9a-f]{40}\z'){throw 'ipc_approved_source_head_invalid'}
+    $head=@(& 'F:\Software\Git\cmd\git.exe' --no-optional-locks -C $script:R4CRepo rev-parse HEAD)
+    if($LASTEXITCODE -ne 0 -or $head.Count -ne 1 -or $head[0] -cne $ApprovedSourceHead){throw 'ipc_source_head_mismatch'}
+    return $head[0]
+}
 function Get-FixedIpcSources {
-    $head=& 'F:\Software\Git\cmd\git.exe' --no-optional-locks -C $script:R4CRepo rev-parse HEAD
-    if($LASTEXITCODE -ne 0 -or $head -cne '05640082d0c577ca2ec2304198dd4999aa920d24'){throw 'ipc_source_head_mismatch'}
+    param([string]$ApprovedSourceHead)
+    $null=Get-FixedIpcSourceHead -ApprovedSourceHead $ApprovedSourceHead
     $allowed=@('Cargo.toml','Cargo.lock','src/lib.rs','src/main.rs','src/launch.rs','src/peer.rs','src/service.rs','src/release.rs','src/release_v2.rs','src/bin/cmg-runtime-boundary-ipc-child.rs','tests/launch_contract.rs','tests/peer_contract.rs','tests/service_contract.rs','tests/release_contract.rs','tests/release_v2_contract.rs','scripts/prepare-test-deployment.ps1','tests/prepare-test-deployment.test.ps1')
     foreach($f in Get-ChildItem $script:R4CCrate -Recurse -File -Force){
         $rel=[IO.Path]::GetRelativePath($script:R4CCrate,$f.FullName).Replace('\','/')
@@ -791,7 +799,7 @@ function Assert-FixedIpcCandidate {
     return $a
 }
 function Invoke-FixedIpcPreparation {
-    [CmdletBinding()]param([Parameter(Mandatory)][string]$TaskRoot)
+    [CmdletBinding()]param([Parameter(Mandatory)][string]$TaskRoot, [string]$ApprovedSourceHead)
     if(-not $IsWindows -or -not [Environment]::Is64BitProcess){throw 'windows_x64_host_required'}
     if(([Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'nonadministrator_required'}
     $root=Assert-R4CPath $TaskRoot; $temp=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Temp'
@@ -800,7 +808,10 @@ function Invoke-FixedIpcPreparation {
     if(@(Get-ChildItem -LiteralPath $root -Force).Count){throw 'output_collision'}
     foreach($v in [Environment]::GetEnvironmentVariables().Keys){if($v -match '^(CARGO_|RUSTUP_|RUSTC|RUSTFLAGS$|CC$|CXX$|CL$|_CL_$|LINK$|_LINK_$|LIB$|LIBPATH$)'){throw "build_override_rejected:$v"}}
     foreach($d in @($script:R4CCrate,(Split-Path $script:R4CCrate),(Split-Path (Split-Path $script:R4CCrate)),$script:R4CRepo,'F:\AI','F:\',(Join-Path $env:USERPROFILE '.cargo'))){foreach($n in @('.cargo\config','.cargo\config.toml','config','config.toml')){if(Test-Path -LiteralPath (Join-Path $d $n)){throw 'cargo_configuration_requires_review'}}}
-    $before=@(Get-FixedIpcSources)
+    $sourceHead=Get-FixedIpcSourceHead -ApprovedSourceHead $ApprovedSourceHead
+    $before=@(Get-FixedIpcSources -ApprovedSourceHead $ApprovedSourceHead)
+    $sourceChanges=@(& 'F:\Software\Git\cmd\git.exe' --no-optional-locks -C $script:R4CRepo diff HEAD --name-only -- $script:R4CCrate)
+    if($LASTEXITCODE -ne 0){throw 'ipc_source_status_unavailable'}
     $tools='C:\Users\DeanX\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin'
     $cargo=Join-Path $tools 'cargo.exe'; $rustc=Join-Path $tools 'rustc.exe'
     $msvc='C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207'; $linker=Join-Path $msvc 'bin\Hostx64\x64\link.exe'
@@ -821,9 +832,9 @@ function Invoke-FixedIpcPreparation {
         $out=$proc.StandardOutput.ReadToEndAsync(); $err=$proc.StandardError.ReadToEndAsync(); $proc.WaitForExit(); $code=$proc.ExitCode
         Write-R4CText (Join-Path $root 'cargo.stdout') $out.GetAwaiter().GetResult(); Write-R4CText (Join-Path $root 'cargo.stderr') $err.GetAwaiter().GetResult()
     } finally {$proc.Dispose()}
-    Write-R4CText (Join-Path $root 'build-receipt.json') (@{executable=$cargo;arguments=$args;exitCode=$code;tools=$toolIds;cargoVersion=(& $cargo --version);rustcVersion=(& $rustc --version);sourceHead='05640082d0c577ca2ec2304198dd4999aa920d24';productionEligible=$false;externalRuntimeLoading='NOT_PROVEN'}|ConvertTo-Json -Depth 8)
+    Write-R4CText (Join-Path $root 'build-receipt.json') (@{executable=$cargo;arguments=$args;exitCode=$code;tools=$toolIds;cargoVersion=(& $cargo --version);rustcVersion=(& $rustc --version);sourceHead=$sourceHead;approvedSourceHead=$ApprovedSourceHead;sourceIdentityScope='APPROVED_HEAD_BASELINE_PLUS_RECORDED_WORKTREE_FILES';sourceWorktreeChanges=$sourceChanges;productionEligible=$false;externalRuntimeLoading='NOT_PROVEN'}|ConvertTo-Json -Depth 8)
     if($code -ne 0){throw "offline_build_failed:$code"}
-    $after=@(Get-FixedIpcSources)
+    $after=@(Get-FixedIpcSources -ApprovedSourceHead $ApprovedSourceHead)
     if(($before|ConvertTo-Json -Compress) -cne ($after|ConvertTo-Json -Compress)){throw 'source_changed_during_build'}
     $hostSource=Join-Path $target 'debug\cmg-runtime-boundary-test-service.exe'; $childSource=Join-Path $target 'debug\cmg-runtime-boundary-ipc-child.exe'
     $hostId=Get-R4CFileIdentity $hostSource; $childId=Get-R4CFileIdentity $childSource
@@ -862,12 +873,12 @@ function Invoke-FixedIpcPreparation {
     $inventory=@(Get-ChildItem -LiteralPath $final -Recurse -File|ForEach-Object {$id=Get-R4CFileIdentity $_.FullName; [ordered]@{path=[IO.Path]::GetRelativePath($final,$_.FullName).Replace('\','/');size=$id.size;sha256=$id.sha256}}|Sort-Object path)
     Write-R4CText (Join-Path $root 'package-files.json') ($inventory|ConvertTo-Json -Depth 8)
     [IO.File]::Delete((Join-Path $root '.incomplete'))
-    $receipt=[ordered]@{schema='cmg-fixed-ipc-preparation-v1';status='PASS_NONPRODUCTION';candidateDirectory=$final;targetDirectory=$targetDirectory;artifactId=$artifact;host=$hostId;child=$childId;manifestSHA256=$mh;fileCount=$inventory.Count;packageIdentity=(Get-R4CFileIdentity (Join-Path $root 'package-files.json')).sha256;installationPerformed=$false;productionEligible=$false;aclAcceptance='NOT_EXECUTED';fixtureMetadata='SYNTHETIC_ONLY_NOT_A_GATEWAY_BUILD'}
+    $receipt=[ordered]@{schema='cmg-fixed-ipc-preparation-v1';status='PASS_NONPRODUCTION';sourceHead=$sourceHead;approvedSourceHead=$ApprovedSourceHead;sourceIdentityScope='APPROVED_HEAD_BASELINE_PLUS_RECORDED_WORKTREE_FILES';sourceWorktreeChanges=$sourceChanges;candidateDirectory=$final;targetDirectory=$targetDirectory;artifactId=$artifact;host=$hostId;child=$childId;manifestSHA256=$mh;fileCount=$inventory.Count;packageIdentity=(Get-R4CFileIdentity (Join-Path $root 'package-files.json')).sha256;installationPerformed=$false;productionEligible=$false;aclAcceptance='NOT_EXECUTED';fixtureMetadata='SYNTHETIC_ONLY_NOT_A_GATEWAY_BUILD'}
     Write-R4CText (Join-Path $root 'preparation-receipt.json') ($receipt|ConvertTo-Json -Depth 10)
     return $receipt
 }
 if (-not $LibraryOnly) {
     if ([string]::IsNullOrEmpty($TaskRoot)) { throw 'task_root_required' }
-    if ($FixedIpc) { Invoke-FixedIpcPreparation -TaskRoot $TaskRoot | ConvertTo-Json -Depth 12 }
+    if ($FixedIpc) { Invoke-FixedIpcPreparation -TaskRoot $TaskRoot -ApprovedSourceHead $ApprovedSourceHead | ConvertTo-Json -Depth 12 }
     else { Invoke-R4CPreparation -TaskRoot $TaskRoot | ConvertTo-Json -Depth 12 }
 }
